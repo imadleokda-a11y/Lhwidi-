@@ -1,0 +1,32 @@
+@import "tailwindcss";
+
+@layer base {
+  html {
+    font-family: "Cairo", system-ui, -apple-system, sans-serif;
+    background-color: #0a0f1e;
+    color: #f1f5f9;
+  }
+
+  body {
+    min-height: 100vh;
+    background-color: #0a0f1e;
+  }
+}
+
+.font-mono-nums {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.blueprint-grid {
+  background-image:
+    linear-gradient(to right, rgba(255, 122, 26, 0.04) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 122, 26, 0.04) 1px, transparent 1px),
+    linear-gradient(to right, rgba(56, 189, 248, 0.025) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(56, 189, 248, 0.025) 1px, transparent 1px);
+  background-size: 96px 96px, 96px 96px, 24px 24px, 24px 24px;
+}
+
+.pb-safe {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}

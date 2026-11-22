@@ -1,0 +1,6 @@
+{
+  "name": "فاهم بلان - Fahem Blan",
+  "description": "تطبيق مغربي ذكي لفهم مخططات البناء بالدارجة المغربية الصوتية، حساب مواد البناء، وتسيير المشاريع.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
