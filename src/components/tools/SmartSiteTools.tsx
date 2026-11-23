@@ -586,6 +586,38 @@ export const SmartSiteTools: React.FC<{ toolId: ToolId }> = ({ toolId }) => {
   }
 
   if (toolId === 'crack-detector') {
+    const compressCrackImage = (src: string): Promise<string> =>
+      new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => {
+          try {
+            const draw = (maxDim: number, q: number) => {
+              let w = img.naturalWidth || img.width;
+              let h = img.naturalHeight || img.height;
+              if (w > maxDim || h > maxDim) {
+                const r = Math.min(maxDim / w, maxDim / h);
+                w = Math.max(1, Math.round(w * r));
+                h = Math.max(1, Math.round(h * r));
+              }
+              const c = document.createElement('canvas');
+              c.width = w;
+              c.height = h;
+              const ctx = c.getContext('2d');
+              if (!ctx) return src;
+              ctx.drawImage(img, 0, 0, w, h);
+              return c.toDataURL('image/jpeg', q);
+            };
+            let out = draw(896, 0.68);
+            if (out.length > 280_000) out = draw(720, 0.45);
+            resolve(out);
+          } catch {
+            resolve(src);
+          }
+        };
+        img.onerror = () => resolve(src);
+        img.src = src;
+      });
+
     const analyzeCrack = async (imgData: string) => {
       const allowance = await checkAllowanceBeforeAnalysis();
       if (!allowance.ok) {
@@ -597,16 +629,25 @@ export const SmartSiteTools: React.FC<{ toolId: ToolId }> = ({ toolId }) => {
       setCrackErr(null);
       setCrackResult(null);
       try {
+        const compactImg = imgData.startsWith('data:') && imgData.length > 280_000
+          ? await compressCrackImage(imgData)
+          : imgData;
         const res = await fetch('/api/detect-cracks', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ imageData: imgData, mimeType: 'image/jpeg' }),
+          body: JSON.stringify({ imageBase64: compactImg, mimeType: 'image/jpeg' }),
         });
-        const data = await res.json();
-        if (!res.ok || !data.success) {
+        const raw = await res.text();
+        let data: { success?: boolean; diagnosis?: CrackDiagnosis; error?: string } = {};
+        try {
+          data = raw ? JSON.parse(raw) : {};
+        } catch {
+          throw new Error(res.status === 413 ? 'حجم الصورة كبير بزاف، عاود التقطها.' : 'تعذر الاتصال بالخادم، عاود حاول.');
+        }
+        if (!res.ok || !data.success || !data.diagnosis) {
           throw new Error(data.error || 'تعذر فحص الصورة');
         }
-        setCrackResult(data.diagnosis as CrackDiagnosis);
+        setCrackResult(data.diagnosis);
         await consumeTrial();
         if (settings.voiceEnabled && data.diagnosis?.audioScript) {
           void speakPro(data.diagnosis.audioScript, { id: 'crack-diagnosis-voice', useCloudTts: true });

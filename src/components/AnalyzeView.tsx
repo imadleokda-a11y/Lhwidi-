@@ -12,7 +12,6 @@ import {
   Hammer,
   Loader2,
   Mic,
-  MicOff,
   Pencil,
   Send,
   Sparkles,
@@ -76,45 +75,39 @@ async function prepareImageForAnalysis(
     img.crossOrigin = 'anonymous';
     img.onload = () => {
       try {
-        const maxDim = 1024;
-        let w = img.naturalWidth || img.width;
-        let h = img.naturalHeight || img.height;
-        if (w > maxDim || h > maxDim) {
-          const ratio = Math.min(maxDim / w, maxDim / h);
-          w = Math.round(w * ratio);
-          h = Math.round(h * ratio);
-        }
-        const canvas = document.createElement('canvas');
-        canvas.width = w;
-        canvas.height = h;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) {
-          reject(new Error('تعذر معالجة الصورة'));
-          return;
-        }
-        ctx.drawImage(img, 0, 0, w, h);
-        const analysisDataUrl = canvas.toDataURL('image/jpeg', 0.72);
+        const renderJpeg = (maxDim: number, quality: number): string => {
+          let w = img.naturalWidth || img.width;
+          let h = img.naturalHeight || img.height;
+          if (w > maxDim || h > maxDim) {
+            const ratio = Math.min(maxDim / w, maxDim / h);
+            w = Math.max(1, Math.round(w * ratio));
+            h = Math.max(1, Math.round(h * ratio));
+          }
+          const canvas = document.createElement('canvas');
+          canvas.width = w;
+          canvas.height = h;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            throw new Error('تعذر معالجة الصورة');
+          }
+          ctx.drawImage(img, 0, 0, w, h);
+          return canvas.toDataURL('image/jpeg', quality);
+        };
 
-        const thumbMax = 640;
-        let tw = img.naturalWidth || img.width;
-        let th = img.naturalHeight || img.height;
-        if (tw > thumbMax || th > thumbMax) {
-          const ratio = Math.min(thumbMax / tw, thumbMax / th);
-          tw = Math.round(tw * ratio);
-          th = Math.round(th * ratio);
+        let analysisDataUrl = renderJpeg(896, 0.68);
+        if (analysisDataUrl.length > 280_000) {
+          analysisDataUrl = renderJpeg(896, 0.52);
         }
-        const tCanvas = document.createElement('canvas');
-        tCanvas.width = tw;
-        tCanvas.height = th;
-        const tCtx = tCanvas.getContext('2d');
-        if (!tCtx) {
-          reject(new Error('تعذر إنشاء مصغرة الصورة'));
-          return;
+        if (analysisDataUrl.length > 300_000) {
+          analysisDataUrl = renderJpeg(720, 0.44);
         }
-        tCtx.drawImage(img, 0, 0, tw, th);
-        let thumbnailDataUrl = tCanvas.toDataURL('image/jpeg', 0.65);
-        if (thumbnailDataUrl.length > 230_000) {
-          thumbnailDataUrl = tCanvas.toDataURL('image/jpeg', 0.4);
+        if (analysisDataUrl.length > 320_000) {
+          analysisDataUrl = renderJpeg(600, 0.36);
+        }
+
+        let thumbnailDataUrl = renderJpeg(560, 0.55);
+        if (thumbnailDataUrl.length > 180_000) {
+          thumbnailDataUrl = renderJpeg(420, 0.38);
         }
         resolve({ analysisDataUrl, thumbnailDataUrl, mimeType: 'image/jpeg' });
       } catch (err) {
@@ -124,6 +117,19 @@ async function prepareImageForAnalysis(
     img.onerror = () => reject(new Error('ما قدرناش نقراو هاد الصورة'));
     img.src = src;
   });
+}
+
+async function parseApiJson<T extends Record<string, unknown>>(res: Response): Promise<T> {
+  const raw = await res.text();
+  if (!raw) return {} as T;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    if (res.status === 413) {
+      throw new Error('حجم الصورة كبير بزاف، عاود التقط صورة واضحة أو خفيفة.');
+    }
+    throw new Error(`تعذر الاتصال بالخادم (${res.status || 'خطأ مؤقت'})، عاود حاول.`);
+  }
 }
 
 interface ChatMessage {
@@ -189,6 +195,10 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
   const srTranscriptRef = useRef('');
   const srSubmittedRef = useRef(false);
   const srErrorRef = useRef(false);
+  const isHoldingMicRef = useRef(false);
+  const pressStartAtRef = useRef(0);
+  const stopOnStartRef = useRef(false);
+  const releaseTailTimerRef = useRef<number | null>(null);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const lastAutoAnalyzedRef = useRef<string | null>(null);
   const sendChatRef = useRef<(overrideText?: string) => Promise<void>>(async () => {});
@@ -257,18 +267,16 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            imageData: payloadImg,
             imageBase64: payloadImg,
             mimeType: payloadMime,
-            userNotes: trimmedNotes,
             notes: trimmedNotes,
           }),
         });
-        const data = await res.json().catch(() => ({}));
+        const data = await parseApiJson<{ success?: boolean; analysis?: BlueprintAnalysis; error?: string }>(res);
         if (!res.ok || !data.success || !data.analysis) {
           throw new Error(data.error || 'تعذر تحليل البلان، عاود حاول.');
         }
-        result = data.analysis as BlueprintAnalysis;
+        result = data.analysis;
         setCachedAnalysis(cacheKey, result);
       }
 
@@ -330,19 +338,41 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
     setIsChatLoading(true);
 
     try {
+      let chatImg: string | undefined;
+      let chatMime = compressedMime || 'image/jpeg';
+      if (!analysis && imageSrc) {
+        if (compressedSrc) {
+          chatImg = compressedSrc;
+        } else if (imageSrc.startsWith('data:') && imageSrc.length > 350_000) {
+          try {
+            const prepared = await prepareImageForAnalysis(imageSrc);
+            setCompressedSrc(prepared.analysisDataUrl);
+            setCompressedMime(prepared.mimeType);
+            chatImg = prepared.analysisDataUrl;
+            chatMime = prepared.mimeType;
+          } catch {
+            // ignore
+          }
+        } else if (!imageSrc.startsWith('data:') || imageSrc.length <= 420_000) {
+          chatImg = imageSrc;
+        }
+      }
+
       const res = await fetch('/api/chat-plan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           question,
-          imageData: compressedSrc || imageSrc,
-          mimeType: compressedMime,
+          ...(chatImg ? { imageBase64: chatImg, mimeType: chatMime } : {}),
           analysisContext: analysis,
-          history: messages.map((m) => ({ role: m.role, text: m.text })),
+          history: messages.slice(-8).map((m) => ({
+            role: m.role,
+            text: m.text.slice(0, 600),
+          })),
         }),
       });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data.success) {
+      const data = await parseApiJson<{ success?: boolean; reply?: string; error?: string }>(res);
+      if (!res.ok || !data.success || !data.reply) {
         throw new Error(data.error || 'تعذر الرد دابا.');
       }
       const replyMsg: ChatMessage = {
@@ -399,6 +429,10 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
       window.clearTimeout(autoSendTimerRef.current);
       autoSendTimerRef.current = null;
     }
+    if (releaseTailTimerRef.current !== null) {
+      window.clearTimeout(releaseTailTimerRef.current);
+      releaseTailTimerRef.current = null;
+    }
     cleanupMicAudio();
     if (mediaRecorderRef.current) {
       const rec = mediaRecorderRef.current;
@@ -432,6 +466,7 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
   useEffect(() => {
     return () => {
       manualStopRef.current = true;
+      isHoldingMicRef.current = false;
       cleanupAllMic(true);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -455,32 +490,24 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
     const clean = rawText.replace(/\s+/g, ' ').trim();
     if (!clean) {
       setMicStatus(null);
-      setMicError('ما سمعت حتى كلمة واضحة، قرب شوية للميكرو وعاود هضر بالدارجة.');
+      setMicError('ما سمعت حتى كلمة واضحة، برك على الميكرو وهضر بالدارجة.');
       return;
     }
     setMicError(null);
-    setChatInput(clean);
-    setMicStatus(`سمعتك: "${clean}" — كيتصيفط دابا...`);
-    if (autoSendTimerRef.current !== null) {
-      window.clearTimeout(autoSendTimerRef.current);
-    }
-    autoSendTimerRef.current = window.setTimeout(() => {
-      autoSendTimerRef.current = null;
-      setMicStatus(null);
-      setChatInput('');
-      void sendChatRef.current(clean);
-    }, 450);
+    setMicStatus(null);
+    setChatInput('');
+    void sendChatRef.current(clean);
   };
 
   const transcribeAudioBlob = async (blob: Blob, mime: string) => {
-    if (blob.size < 400) {
+    if (blob.size < 150) {
       setMicStatus(null);
-      setMicError('التسجيل قصير بزاف، عاود ضغط على الميكرو وهضر بالدارجة.');
+      setMicError('التسجيل قصير بزاف، برك على الميكرو وهضر بالدارجة وطلق يديك.');
       return;
     }
     setIsTranscribing(true);
     setMicError(null);
-    setMicStatus('سمعتك، دابا كنكتب كلامك بالدارجة...');
+    setMicStatus('كنكتب كلامك بالدارجة...');
     try {
       const audioBase64 = await readBlobAsDataUrl(blob);
       const cleanMime = (mime || blob.type || 'audio/webm').split(';')[0];
@@ -489,7 +516,7 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ audioBase64, mimeType: cleanMime }),
       });
-      const data = await res.json().catch(() => ({}));
+      const data = await parseApiJson<{ success?: boolean; text?: string; error?: string }>(res);
       if (!res.ok || data.success === false) {
         throw new Error(data.error || 'تعذر تحويل الصوت لكتابة، عاود حاول.');
       }
@@ -530,6 +557,34 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
     }, SILENCE_STOP_MS);
   };
 
+  const stopAndSendRecording = () => {
+    if (releaseTailTimerRef.current !== null) {
+      window.clearTimeout(releaseTailTimerRef.current);
+      releaseTailTimerRef.current = null;
+    }
+    manualStopRef.current = true;
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      cleanupMicAudio();
+      setIsRecording(false);
+      setMicStatus('كيتصيفط الصوت...');
+      try {
+        mediaRecorderRef.current.stop();
+      } catch {
+        cleanupAllMic(true);
+        setMicStatus(null);
+      }
+      return;
+    }
+    const srText = srTranscriptRef.current.trim();
+    cleanupAllMic(true);
+    setMicStatus(null);
+    if (srText) {
+      srSubmittedRef.current = true;
+      srTranscriptRef.current = '';
+      deliverTranscriptAndSend(srText);
+    }
+  };
+
   const startSpeechRecognitionFallback = () => {
     const win = window as unknown as {
       SpeechRecognition?: new () => Record<string, unknown>;
@@ -547,7 +602,7 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
     manualStopRef.current = false;
     srErrorRef.current = false;
     setChatInput('');
-    setMicStatus('هضر بالدارجة دابا... غير تسكت 1.5 ثانية غيتكتب ويتصيفط');
+    setMicStatus('كنسمعك... غير طلق يديك غيتكتب ويتصيفط');
 
     const langs = ['ar-MA', 'ar-SA', 'ar'];
     const tryLang = (idx: number) => {
@@ -579,13 +634,15 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
           hasSpokenRef.current = true;
           srTranscriptRef.current = cleaned;
           setChatInput(cleaned);
-          setMicStatus(`سمعتك: "${cleaned}" — غير تسكت 1.5ث غيتصيفط`);
-          scheduleSrSilenceStop();
+          setMicStatus(`سمعتك: "${cleaned}"`);
+          if (!isHoldingMicRef.current) {
+            scheduleSrSilenceStop();
+          }
         }
       };
 
       rec.onspeechend = () => {
-        if (hasSpokenRef.current && srTranscriptRef.current.trim()) {
+        if (!isHoldingMicRef.current && hasSpokenRef.current && srTranscriptRef.current.trim()) {
           scheduleSrSilenceStop();
         }
       };
@@ -619,8 +676,8 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
             : code === 'audio-capture'
               ? 'ما لقيناش ميكروفون شغال فهاد الجهاز.'
               : code === 'no-speech'
-                ? 'ما سمعت حتى كلمة فالميكرو، قرب شوية وعاود هضر بصوت واضح.'
-                : 'وقع مشكل فالميكروفون، عاود ضغط على أيقونة الميكرو وهضر بالدارجة.'
+                ? 'ما سمعت حتى كلمة فالميكرو، برك وهضر بصوت واضح.'
+                : 'وقع مشكل فالميكروفون، عاود برك على الميكرو وهضر بالدارجة.'
         );
       };
 
@@ -630,12 +687,11 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
         if (text) {
           setIsRecording(false);
           recognitionRef.current = null;
-          setMicStatus(`سمعتك: "${text}" — غادي يتصيفط بعد 1.5ث...`);
-          scheduleSrSilenceStop();
+          deliverTranscriptAndSend(text);
         } else {
           cleanupAllMic(true);
           setMicStatus(null);
-          setMicError('الميكروفون حبس قبل ما يسمع كلام واضح. عاود ضغط وهضر نيشان بالدارجة.');
+          setMicError('الميكروفون حبس قبل ما يسمع كلام واضح. برك وهضر بالدارجة.');
         }
       };
 
@@ -643,43 +699,24 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
       try {
         rec.start();
         setIsRecording(true);
+        if (stopOnStartRef.current) {
+          stopOnStartRef.current = false;
+          releaseTailTimerRef.current = window.setTimeout(() => {
+            stopAndSendRecording();
+          }, 120);
+        }
       } catch {
         cleanupAllMic(true);
         setMicStatus(null);
-        setMicError('تعذر تشغيل الميكروفون، عاود ضغط على الزر وتأكد من إذن الميكرو.');
+        setMicError('تعذر تشغيل الميكروفون، عاود جرب وتأكد من إذن الميكرو.');
       }
     };
 
     tryLang(0);
   };
 
-  const toggleVoiceQuestion = async () => {
-    if (isTranscribing) return;
-
-    if (isRecording) {
-      manualStopRef.current = true;
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-        cleanupMicAudio();
-        setIsRecording(false);
-        setMicStatus('كنجمع الصوت ونكتبو...');
-        try {
-          mediaRecorderRef.current.stop();
-        } catch {
-          cleanupAllMic(true);
-          setMicStatus(null);
-        }
-        return;
-      }
-      const srText = srTranscriptRef.current.trim();
-      cleanupAllMic(true);
-      setMicStatus(null);
-      if (srText) {
-        srSubmittedRef.current = true;
-        srTranscriptRef.current = '';
-        deliverTranscriptAndSend(srText);
-      }
-      return;
-    }
+  const startVoiceRecording = async () => {
+    if (isTranscribing || isRecording || isChatLoading || isAnalyzing) return;
 
     stop();
     setError(null);
@@ -720,6 +757,8 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
         }
       }
     } catch (err) {
+      isHoldingMicRef.current = false;
+      stopOnStartRef.current = false;
       setMicStatus(null);
       const errName = err instanceof DOMException ? err.name : '';
       setMicError(
@@ -727,8 +766,13 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
           ? 'المتصفح منع الميكروفون. عطيه الإذن (Allow) من القفل لي حدا رابط الموقع الفوق.'
           : errName === 'NotFoundError' || errName === 'DevicesNotFoundError'
             ? 'ما لقيناش ميكروفون شغال فهاد الجهاز.'
-            : 'تعذر تشغيل الميكروفون، تأكد من الإذن وعاود ضغط على الزر.'
+            : 'تعذر تشغيل الميكروفون، تأكد من الإذن وعاود برك على الزر.'
       );
+      return;
+    }
+
+    if (cancelledMicRef.current) {
+      stream.getTracks().forEach((t) => t.stop());
       return;
     }
 
@@ -767,7 +811,7 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
       if (cancelledMicRef.current) return;
       cleanupAllMic(true);
       setMicStatus(null);
-      setMicError('وقع مشكل فالتسجيل، عاود ضغط على الميكرو وهضر بالدارجة.');
+      setMicError('وقع مشكل فالتسجيل، عاود برك على الميكرو وهضر بالدارجة.');
     };
 
     recorder.onstop = () => {
@@ -780,7 +824,7 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
       if (wasCancelled) return;
       if (!hasSpokenRef.current && !manualStopRef.current) {
         setMicStatus(null);
-        setMicError('ما سمعت حتى صوت فالميكرو، قرب شوية وعاود هضر بصوت واضح.');
+        setMicError('ما سمعت حتى صوت فالميكرو، برك وهضر بصوت واضح.');
         return;
       }
       const mime = recorder.mimeType || supportedMime || 'audio/webm';
@@ -789,7 +833,7 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
     };
 
     try {
-      recorder.start(250);
+      recorder.start(100);
     } catch {
       cleanupAllMic(true);
       setMicStatus(null);
@@ -798,7 +842,19 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
     }
 
     setIsRecording(true);
-    setMicStatus('هضر بالدارجة دابا... غير تسكت 1.5 ثانية غيتكتب ويتصيفط');
+    setMicStatus(
+      isHoldingMicRef.current
+        ? 'كنسمعك... غير طلق يديك باش يتصيفط'
+        : 'كنسمعك... هضر وسكت شوية باش يتصيفط'
+    );
+
+    if (stopOnStartRef.current) {
+      stopOnStartRef.current = false;
+      releaseTailTimerRef.current = window.setTimeout(() => {
+        stopAndSendRecording();
+      }, 120);
+      return;
+    }
 
     try {
       const AudioCtx =
@@ -837,33 +893,40 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
           if (!hasSpokenRef.current && rms < 0.035) {
             noiseFloor = noiseFloor * 0.85 + rms * 0.15;
           }
-          const startThresh = Math.max(0.015, Math.min(0.05, noiseFloor * 2.4));
-          const keepThresh = Math.max(0.011, startThresh * 0.72);
+          const startThresh = Math.max(0.014, Math.min(0.05, noiseFloor * 2.4));
+          const keepThresh = Math.max(0.01, startThresh * 0.72);
 
           if (rms >= (hasSpokenRef.current ? keepThresh : startThresh)) {
             speechFrames += 1;
             lastSoundAt = now;
             if (!hasSpokenRef.current && speechFrames >= 2) {
               hasSpokenRef.current = true;
-              setMicStatus('كنسمعك... غير تسكت 1.5 ثانية غيتكتب ويتصيفط');
+              setMicStatus(
+                isHoldingMicRef.current
+                  ? 'كنسمعك... غير طلق يديك باش يتصيفط'
+                  : 'كنسمعك... غير تسكت غيتصيفط'
+              );
             }
           } else {
             speechFrames = 0;
           }
+
+          // While finger is held down (WhatsApp style), never auto-stop on pause until user lifts finger
+          if (isHoldingMicRef.current) return;
 
           if (hasSpokenRef.current && now - lastSoundAt >= SILENCE_STOP_MS) {
             if (silenceIntervalRef.current !== null) {
               window.clearInterval(silenceIntervalRef.current);
               silenceIntervalRef.current = null;
             }
-            setMicStatus('سمعتك، كنجمع الصوت...');
+            setMicStatus('كيتصيفط الصوت...');
             activeRec.stop();
           } else if (!hasSpokenRef.current && now - startedAt >= 9500) {
             cancelledMicRef.current = true;
             cleanupAllMic(true);
             setMicStatus(null);
-            setMicError('ما سمعت حتى صوت فالميكرو، قرب شوية وعاود هضر بصوت واضح.');
-          } else if (now - startedAt >= 35000) {
+            setMicError('ما سمعت حتى صوت فالميكرو، برك وهضر بصوت واضح.');
+          } else if (now - startedAt >= 45000) {
             if (silenceIntervalRef.current !== null) {
               window.clearInterval(silenceIntervalRef.current);
               silenceIntervalRef.current = null;
@@ -873,9 +936,61 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
         }, 60);
       }
     } catch {
-      // If WebAudio RMS monitor fails, manual tap-to-stop still works cleanly
+      // If WebAudio RMS monitor fails, release/tap stop still works cleanly
     }
   };
+
+  const handleMicRelease = () => {
+    if (!isHoldingMicRef.current) return;
+    isHoldingMicRef.current = false;
+    const heldMs = Date.now() - pressStartAtRef.current;
+    if (heldMs >= 200) {
+      if (
+        (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') ||
+        recognitionRef.current
+      ) {
+        releaseTailTimerRef.current = window.setTimeout(() => {
+          stopAndSendRecording();
+        }, 120);
+      } else {
+        stopOnStartRef.current = true;
+      }
+    } else if (isRecording) {
+      setMicStatus('كنسمعك... هضر وسكت شوية ولا برك باش يتصيفط');
+    }
+  };
+
+  const handleMicPointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
+    if (isTranscribing || isChatLoading || isAnalyzing) return;
+    e.preventDefault();
+    if (isRecording) {
+      isHoldingMicRef.current = false;
+      stopAndSendRecording();
+      return;
+    }
+    isHoldingMicRef.current = true;
+    stopOnStartRef.current = false;
+    pressStartAtRef.current = Date.now();
+    try {
+      e.currentTarget.setPointerCapture?.(e.pointerId);
+    } catch {
+      // ignore
+    }
+    void startVoiceRecording();
+  };
+
+  useEffect(() => {
+    const onGlobalRelease = () => {
+      handleMicRelease();
+    };
+    window.addEventListener('pointerup', onGlobalRelease);
+    window.addEventListener('pointercancel', onGlobalRelease);
+    return () => {
+      window.removeEventListener('pointerup', onGlobalRelease);
+      window.removeEventListener('pointercancel', onGlobalRelease);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isRecording]);
 
   const handleSave = async () => {
     if (!analysis || isSaving || savedSuccess) return;
@@ -1124,11 +1239,11 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
           )}
 
           {micStatus && (
-            <div className="px-4 py-2 border-t border-red-500/30 bg-red-950/35 text-xs font-bold text-red-200 flex items-center gap-2">
+            <div className="px-4 py-2 border-t border-emerald-500/30 bg-emerald-950/25 text-xs font-bold text-emerald-200 flex items-center gap-2">
               {isTranscribing ? (
-                <Loader2 className="w-3.5 h-3.5 animate-spin text-[#ff7a1a] shrink-0" />
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-400 shrink-0" />
               ) : (
-                <span className="w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse shrink-0" />
+                <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
               )}
               <span>{micStatus}</span>
             </div>
@@ -1150,19 +1265,28 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
           >
             <button
               type="button"
-              onClick={() => void toggleVoiceQuestion()}
+              onPointerDown={handleMicPointerDown}
+              onPointerUp={handleMicRelease}
+              onPointerCancel={handleMicRelease}
+              onContextMenu={(e) => e.preventDefault()}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  if (isRecording) stopAndSendRecording();
+                  else void startVoiceRecording();
+                }
+              }}
               disabled={isTranscribing || isChatLoading || isAnalyzing}
-              aria-label={isRecording ? 'حبس الميكرو وصيفط' : 'سول بالصوت'}
-              className={`min-h-[46px] min-w-[46px] rounded-xl flex items-center justify-center shrink-0 transition-colors disabled:opacity-50 ${
+              title="برك وطلق باش تهضر بحال واتساب"
+              aria-label={isRecording ? 'طلق يديك باش يتصيفط' : 'برك وهضر بالصوت بحال واتساب'}
+              className={`min-h-[46px] min-w-[46px] rounded-xl flex items-center justify-center shrink-0 transition-all touch-none select-none disabled:opacity-50 ${
                 isRecording
-                  ? 'bg-red-500 text-white animate-pulse'
+                  ? 'bg-emerald-500 text-[#0a0f1e] ring-4 ring-emerald-500/25 scale-105'
                   : 'border border-white/15 bg-[#0a0f1e] text-[#ff7a1a] hover:border-[#ff7a1a]'
               }`}
             >
               {isTranscribing ? (
                 <Loader2 className="w-5 h-5 animate-spin" />
-              ) : isRecording ? (
-                <MicOff className="w-5 h-5" />
               ) : (
                 <Mic className="w-5 h-5" />
               )}
@@ -1174,7 +1298,7 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
                 setChatInput(e.target.value);
                 if (micError) setMicError(null);
               }}
-              placeholder="هضر بالميكرو ولا كتب سؤالك على البلان بالدارجة..."
+              placeholder="برك على الميكرو وهضر بحال واتساب، ولا كتب سؤالك..."
               className="flex-1 min-h-[46px] rounded-xl border border-white/15 bg-[#0a0f1e] px-4 text-sm text-white placeholder:text-slate-500 focus:border-[#ff7a1a] focus:outline-none"
             />
             <button
