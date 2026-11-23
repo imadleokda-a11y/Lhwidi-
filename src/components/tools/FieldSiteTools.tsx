@@ -489,7 +489,7 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
             const res = await fetch('/api/transcribe', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ audioBase64: base64, mimeType: blob.type || 'audio/webm' }),
+              body: JSON.stringify({ audioBase64: base64, mimeType: (blob.type || 'audio/webm').split(';')[0] }),
             });
             const data = await res.json();
             if (res.ok && data.success && data.text) {

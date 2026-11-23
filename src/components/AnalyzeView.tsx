@@ -177,8 +177,21 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const micAudioCtxRef = useRef<AudioContext | null>(null);
+  const silenceIntervalRef = useRef<number | null>(null);
+  const srTimeoutRef = useRef<number | null>(null);
+  const autoSendTimerRef = useRef<number | null>(null);
+  const recognitionRef = useRef<{ stop: () => void } | null>(null);
+  const hasSpokenRef = useRef(false);
+  const manualStopRef = useRef(false);
+  const cancelledMicRef = useRef(false);
+  const srTranscriptRef = useRef('');
+  const srSubmittedRef = useRef(false);
+  const srErrorRef = useRef(false);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const lastAutoAnalyzedRef = useRef<string | null>(null);
+  const sendChatRef = useRef<(overrideText?: string) => Promise<void>>(async () => {});
 
   useEffect(() => {
     if (initialImageSrc) {
@@ -348,69 +361,519 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
     }
   };
 
-  const toggleVoiceQuestion = async () => {
-    if (isRecording && mediaRecorderRef.current) {
-      mediaRecorderRef.current.stop();
-      setIsRecording(false);
+  useEffect(() => {
+    sendChatRef.current = sendChatQuestion;
+  });
+
+  const SILENCE_STOP_MS = 1500;
+
+  const cleanupMicAudio = () => {
+    if (silenceIntervalRef.current !== null) {
+      window.clearInterval(silenceIntervalRef.current);
+      silenceIntervalRef.current = null;
+    }
+    if (micAudioCtxRef.current) {
+      const ctx = micAudioCtxRef.current;
+      micAudioCtxRef.current = null;
+      ctx.close().catch(() => undefined);
+    }
+    if (micStreamRef.current) {
+      const s = micStreamRef.current;
+      micStreamRef.current = null;
+      s.getTracks().forEach((t) => {
+        try {
+          t.stop();
+        } catch {
+          // ignore
+        }
+      });
+    }
+  };
+
+  const cleanupAllMic = (cancelRecording = false) => {
+    if (srTimeoutRef.current !== null) {
+      window.clearTimeout(srTimeoutRef.current);
+      srTimeoutRef.current = null;
+    }
+    if (autoSendTimerRef.current !== null) {
+      window.clearTimeout(autoSendTimerRef.current);
+      autoSendTimerRef.current = null;
+    }
+    cleanupMicAudio();
+    if (mediaRecorderRef.current) {
+      const rec = mediaRecorderRef.current;
+      mediaRecorderRef.current = null;
+      if (cancelRecording) {
+        cancelledMicRef.current = true;
+        rec.ondataavailable = null;
+        rec.onstop = null;
+        rec.onerror = null;
+      }
+      if (rec.state !== 'inactive') {
+        try {
+          rec.stop();
+        } catch {
+          // ignore
+        }
+      }
+    }
+    if (recognitionRef.current) {
+      const r = recognitionRef.current;
+      recognitionRef.current = null;
+      try {
+        r.stop();
+      } catch {
+        // ignore
+      }
+    }
+    setIsRecording(false);
+  };
+
+  useEffect(() => {
+    return () => {
+      manualStopRef.current = true;
+      cleanupAllMic(true);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const readBlobAsDataUrl = (blob: Blob): Promise<string> =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        if (typeof reader.result === 'string') {
+          resolve(reader.result);
+        } else {
+          reject(new Error('تعذر قراءة التسجيل الصوتي'));
+        }
+      };
+      reader.onerror = () => reject(new Error('تعذر قراءة التسجيل الصوتي'));
+      reader.readAsDataURL(blob);
+    });
+
+  const deliverTranscriptAndSend = (rawText: string) => {
+    const clean = rawText.replace(/\s+/g, ' ').trim();
+    if (!clean) {
+      setMicStatus(null);
+      setMicError('ما سمعت حتى كلمة واضحة، قرب شوية للميكرو وعاود هضر بالدارجة.');
       return;
     }
-
     setMicError(null);
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setMicError('الميكروفون ما مدعومش فهاد المتصفح، كتب سؤالك مباشرة.');
+    setChatInput(clean);
+    setMicStatus(`سمعتك: "${clean}" — كيتصيفط دابا...`);
+    if (autoSendTimerRef.current !== null) {
+      window.clearTimeout(autoSendTimerRef.current);
+    }
+    autoSendTimerRef.current = window.setTimeout(() => {
+      autoSendTimerRef.current = null;
+      setMicStatus(null);
+      setChatInput('');
+      void sendChatRef.current(clean);
+    }, 450);
+  };
+
+  const transcribeAudioBlob = async (blob: Blob, mime: string) => {
+    if (blob.size < 400) {
+      setMicStatus(null);
+      setMicError('التسجيل قصير بزاف، عاود ضغط على الميكرو وهضر بالدارجة.');
+      return;
+    }
+    setIsTranscribing(true);
+    setMicError(null);
+    setMicStatus('سمعتك، دابا كنكتب كلامك بالدارجة...');
+    try {
+      const audioBase64 = await readBlobAsDataUrl(blob);
+      const cleanMime = (mime || blob.type || 'audio/webm').split(';')[0];
+      const res = await fetch('/api/transcribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ audioBase64, mimeType: cleanMime }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.success === false) {
+        throw new Error(data.error || 'تعذر تحويل الصوت لكتابة، عاود حاول.');
+      }
+      const text = typeof data.text === 'string' ? data.text.trim() : '';
+      setIsTranscribing(false);
+      deliverTranscriptAndSend(text);
+    } catch (err: unknown) {
+      setIsTranscribing(false);
+      setMicStatus(null);
+      setMicError(
+        err instanceof Error && err.message
+          ? err.message
+          : 'تعذر تحويل الصوت لكتابة، عاود جرب أو كتب سؤالك بيديك.'
+      );
+    }
+  };
+
+  const submitSpeechRecognitionResult = () => {
+    if (srSubmittedRef.current) return;
+    const text = srTranscriptRef.current.trim();
+    srSubmittedRef.current = true;
+    cleanupAllMic(true);
+    if (text) {
+      srTranscriptRef.current = '';
+      deliverTranscriptAndSend(text);
+    } else {
+      setMicStatus(null);
+    }
+  };
+
+  const scheduleSrSilenceStop = () => {
+    if (!hasSpokenRef.current || srSubmittedRef.current || !srTranscriptRef.current.trim()) return;
+    if (srTimeoutRef.current !== null) {
+      window.clearTimeout(srTimeoutRef.current);
+    }
+    srTimeoutRef.current = window.setTimeout(() => {
+      submitSpeechRecognitionResult();
+    }, SILENCE_STOP_MS);
+  };
+
+  const startSpeechRecognitionFallback = () => {
+    const win = window as unknown as {
+      SpeechRecognition?: new () => Record<string, unknown>;
+      webkitSpeechRecognition?: new () => Record<string, unknown>;
+    };
+    const SR = win.SpeechRecognition || win.webkitSpeechRecognition;
+    if (!SR) {
+      setMicError('المتصفح ما كيدعمش الميكروفون التلقائي، كتب سؤالك هنا.');
       return;
     }
 
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream);
-      audioChunksRef.current = [];
-      mediaRecorderRef.current = recorder;
+    srTranscriptRef.current = '';
+    hasSpokenRef.current = false;
+    srSubmittedRef.current = false;
+    manualStopRef.current = false;
+    srErrorRef.current = false;
+    setChatInput('');
+    setMicStatus('هضر بالدارجة دابا... غير تسكت 1.5 ثانية غيتكتب ويتصيفط');
 
-      recorder.ondataavailable = (ev) => {
-        if (ev.data.size > 0) audioChunksRef.current.push(ev.data);
+    const langs = ['ar-MA', 'ar-SA', 'ar'];
+    const tryLang = (idx: number) => {
+      const rec = new SR() as {
+        lang: string;
+        continuous: boolean;
+        interimResults: boolean;
+        maxAlternatives: number;
+        onresult: ((ev: { results: ArrayLike<{ 0?: { transcript?: string } }> }) => void) | null;
+        onspeechend: (() => void) | null;
+        onerror: ((ev: { error?: string }) => void) | null;
+        onend: (() => void) | null;
+        start: () => void;
+        stop: () => void;
+      };
+      rec.lang = langs[idx];
+      rec.continuous = true;
+      rec.interimResults = true;
+      rec.maxAlternatives = 1;
+
+      rec.onresult = (ev) => {
+        let joined = '';
+        for (let i = 0; i < ev.results.length; i++) {
+          const piece = ev.results[i]?.[0]?.transcript;
+          if (piece) joined += `${piece} `;
+        }
+        const cleaned = joined.replace(/\s+/g, ' ').trim();
+        if (cleaned) {
+          hasSpokenRef.current = true;
+          srTranscriptRef.current = cleaned;
+          setChatInput(cleaned);
+          setMicStatus(`سمعتك: "${cleaned}" — غير تسكت 1.5ث غيتصيفط`);
+          scheduleSrSilenceStop();
+        }
       };
 
-      recorder.onstop = async () => {
-        stream.getTracks().forEach((t) => t.stop());
-        const blob = new Blob(audioChunksRef.current, { type: recorder.mimeType || 'audio/webm' });
-        if (blob.size < 400) {
-          setMicStatus(null);
+      rec.onspeechend = () => {
+        if (hasSpokenRef.current && srTranscriptRef.current.trim()) {
+          scheduleSrSilenceStop();
+        }
+      };
+
+      rec.onerror = (ev) => {
+        const code = ev?.error || '';
+        if (code === 'language-not-supported' && idx + 1 < langs.length) {
+          rec.onresult = null;
+          rec.onspeechend = null;
+          rec.onerror = null;
+          rec.onend = null;
+          try {
+            rec.stop();
+          } catch {
+            // ignore
+          }
+          tryLang(idx + 1);
           return;
         }
-        setIsTranscribing(true);
-        setMicStatus('جاري تحويل الصوت لنص بالدارجة...');
-        try {
-          const reader = new FileReader();
-          reader.onloadend = async () => {
-            const base64 = typeof reader.result === 'string' ? reader.result : '';
-            const res = await fetch('/api/transcribe', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ audioBase64: base64, mimeType: blob.type || 'audio/webm' }),
-            });
-            const data = await res.json();
-            setIsTranscribing(false);
-            setMicStatus(null);
-            if (res.ok && data.success && data.text) {
-              void sendChatQuestion(data.text);
-            } else {
-              setMicError(data.error || 'تعذر تفريغ الصوت.');
-            }
-          };
-          reader.readAsDataURL(blob);
-        } catch {
-          setIsTranscribing(false);
+        if (code === 'aborted' && (manualStopRef.current || srSubmittedRef.current)) return;
+        if (code === 'no-speech' && srTranscriptRef.current.trim()) {
+          scheduleSrSilenceStop();
+          return;
+        }
+        srErrorRef.current = true;
+        cleanupAllMic(true);
+        setMicStatus(null);
+        setMicError(
+          code === 'not-allowed' || code === 'service-not-allowed'
+            ? 'المتصفح منع الميكروفون. عطيه الإذن (Allow) من القفل لي حدا رابط الموقع الفوق.'
+            : code === 'audio-capture'
+              ? 'ما لقيناش ميكروفون شغال فهاد الجهاز.'
+              : code === 'no-speech'
+                ? 'ما سمعت حتى كلمة فالميكرو، قرب شوية وعاود هضر بصوت واضح.'
+                : 'وقع مشكل فالميكروفون، عاود ضغط على أيقونة الميكرو وهضر بالدارجة.'
+        );
+      };
+
+      rec.onend = () => {
+        if (srSubmittedRef.current || manualStopRef.current || srErrorRef.current) return;
+        const text = srTranscriptRef.current.trim();
+        if (text) {
+          setIsRecording(false);
+          recognitionRef.current = null;
+          setMicStatus(`سمعتك: "${text}" — غادي يتصيفط بعد 1.5ث...`);
+          scheduleSrSilenceStop();
+        } else {
+          cleanupAllMic(true);
           setMicStatus(null);
-          setMicError('تعذر معالجة الصوت.');
+          setMicError('الميكروفون حبس قبل ما يسمع كلام واضح. عاود ضغط وهضر نيشان بالدارجة.');
         }
       };
 
-      recorder.start();
-      setIsRecording(true);
-      setMicStatus('كانسمع ليك... هضر وسول على البلان ومن بعد ورك على إيقاف.');
+      recognitionRef.current = rec;
+      try {
+        rec.start();
+        setIsRecording(true);
+      } catch {
+        cleanupAllMic(true);
+        setMicStatus(null);
+        setMicError('تعذر تشغيل الميكروفون، عاود ضغط على الزر وتأكد من إذن الميكرو.');
+      }
+    };
+
+    tryLang(0);
+  };
+
+  const toggleVoiceQuestion = async () => {
+    if (isTranscribing) return;
+
+    if (isRecording) {
+      manualStopRef.current = true;
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        cleanupMicAudio();
+        setIsRecording(false);
+        setMicStatus('كنجمع الصوت ونكتبو...');
+        try {
+          mediaRecorderRef.current.stop();
+        } catch {
+          cleanupAllMic(true);
+          setMicStatus(null);
+        }
+        return;
+      }
+      const srText = srTranscriptRef.current.trim();
+      cleanupAllMic(true);
+      setMicStatus(null);
+      if (srText) {
+        srSubmittedRef.current = true;
+        srTranscriptRef.current = '';
+        deliverTranscriptAndSend(srText);
+      }
+      return;
+    }
+
+    stop();
+    setError(null);
+    setMicError(null);
+
+    if (
+      typeof navigator === 'undefined' ||
+      !navigator.mediaDevices?.getUserMedia ||
+      typeof MediaRecorder === 'undefined'
+    ) {
+      startSpeechRecognitionFallback();
+      return;
+    }
+
+    srTranscriptRef.current = '';
+    hasSpokenRef.current = false;
+    srSubmittedRef.current = false;
+    manualStopRef.current = false;
+    cancelledMicRef.current = false;
+    audioChunksRef.current = [];
+    setChatInput('');
+    setMicStatus('كنفتح الميكروفون...');
+
+    let stream: MediaStream;
+    try {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
+      } catch (err) {
+        if (
+          err instanceof DOMException &&
+          (err.name === 'OverconstrainedError' || err.name === 'ConstraintNotSatisfiedError')
+        ) {
+          stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        } else {
+          throw err;
+        }
+      }
+    } catch (err) {
+      setMicStatus(null);
+      const errName = err instanceof DOMException ? err.name : '';
+      setMicError(
+        errName === 'NotAllowedError' || errName === 'PermissionDeniedError'
+          ? 'المتصفح منع الميكروفون. عطيه الإذن (Allow) من القفل لي حدا رابط الموقع الفوق.'
+          : errName === 'NotFoundError' || errName === 'DevicesNotFoundError'
+            ? 'ما لقيناش ميكروفون شغال فهاد الجهاز.'
+            : 'تعذر تشغيل الميكروفون، تأكد من الإذن وعاود ضغط على الزر.'
+      );
+      return;
+    }
+
+    micStreamRef.current = stream;
+    const supportedMime =
+      (typeof MediaRecorder.isTypeSupported === 'function' &&
+        ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus', 'audio/ogg'].find((m) =>
+          MediaRecorder.isTypeSupported(m)
+        )) ||
+      '';
+
+    let recorder: MediaRecorder;
+    try {
+      const opts: MediaRecorderOptions = { audioBitsPerSecond: 32000 };
+      if (supportedMime) opts.mimeType = supportedMime;
+      recorder = new MediaRecorder(stream, opts);
     } catch {
-      setMicError('تأكد من السماح للميكروفون باش تسول بالصوت.');
+      try {
+        recorder = supportedMime ? new MediaRecorder(stream, { mimeType: supportedMime }) : new MediaRecorder(stream);
+      } catch {
+        cleanupMicAudio();
+        startSpeechRecognitionFallback();
+        return;
+      }
+    }
+
+    mediaRecorderRef.current = recorder;
+
+    recorder.ondataavailable = (ev) => {
+      if (ev.data && ev.data.size > 0) {
+        audioChunksRef.current.push(ev.data);
+      }
+    };
+
+    recorder.onerror = () => {
+      if (cancelledMicRef.current) return;
+      cleanupAllMic(true);
+      setMicStatus(null);
+      setMicError('وقع مشكل فالتسجيل، عاود ضغط على الميكرو وهضر بالدارجة.');
+    };
+
+    recorder.onstop = () => {
+      const wasCancelled = cancelledMicRef.current;
+      const chunks = audioChunksRef.current;
+      audioChunksRef.current = [];
+      mediaRecorderRef.current = null;
+      cleanupMicAudio();
+      setIsRecording(false);
+      if (wasCancelled) return;
+      if (!hasSpokenRef.current && !manualStopRef.current) {
+        setMicStatus(null);
+        setMicError('ما سمعت حتى صوت فالميكرو، قرب شوية وعاود هضر بصوت واضح.');
+        return;
+      }
+      const mime = recorder.mimeType || supportedMime || 'audio/webm';
+      const blob = new Blob(chunks, { type: mime });
+      void transcribeAudioBlob(blob, mime);
+    };
+
+    try {
+      recorder.start(250);
+    } catch {
+      cleanupAllMic(true);
+      setMicStatus(null);
+      setMicError('تعذر بدء تسجيل الصوت، عاود جرب.');
+      return;
+    }
+
+    setIsRecording(true);
+    setMicStatus('هضر بالدارجة دابا... غير تسكت 1.5 ثانية غيتكتب ويتصيفط');
+
+    try {
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (AudioCtx) {
+        const ctx = new AudioCtx();
+        micAudioCtxRef.current = ctx;
+        if (ctx.state === 'suspended') {
+          ctx.resume().catch(() => undefined);
+        }
+        const source = ctx.createMediaStreamSource(stream);
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 1024;
+        source.connect(analyser);
+
+        const samples = new Uint8Array(analyser.fftSize);
+        const startedAt = Date.now();
+        let lastSoundAt = startedAt;
+        let speechFrames = 0;
+        let noiseFloor = 0.008;
+
+        silenceIntervalRef.current = window.setInterval(() => {
+          const activeRec = mediaRecorderRef.current;
+          if (!activeRec || activeRec.state === 'inactive') return;
+
+          analyser.getByteTimeDomainData(samples);
+          let sumSq = 0;
+          for (let i = 0; i < samples.length; i++) {
+            const normalized = (samples[i] - 128) / 128;
+            sumSq += normalized * normalized;
+          }
+          const rms = Math.sqrt(sumSq / samples.length);
+          const now = Date.now();
+
+          if (!hasSpokenRef.current && rms < 0.035) {
+            noiseFloor = noiseFloor * 0.85 + rms * 0.15;
+          }
+          const startThresh = Math.max(0.015, Math.min(0.05, noiseFloor * 2.4));
+          const keepThresh = Math.max(0.011, startThresh * 0.72);
+
+          if (rms >= (hasSpokenRef.current ? keepThresh : startThresh)) {
+            speechFrames += 1;
+            lastSoundAt = now;
+            if (!hasSpokenRef.current && speechFrames >= 2) {
+              hasSpokenRef.current = true;
+              setMicStatus('كنسمعك... غير تسكت 1.5 ثانية غيتكتب ويتصيفط');
+            }
+          } else {
+            speechFrames = 0;
+          }
+
+          if (hasSpokenRef.current && now - lastSoundAt >= SILENCE_STOP_MS) {
+            if (silenceIntervalRef.current !== null) {
+              window.clearInterval(silenceIntervalRef.current);
+              silenceIntervalRef.current = null;
+            }
+            setMicStatus('سمعتك، كنجمع الصوت...');
+            activeRec.stop();
+          } else if (!hasSpokenRef.current && now - startedAt >= 9500) {
+            cancelledMicRef.current = true;
+            cleanupAllMic(true);
+            setMicStatus(null);
+            setMicError('ما سمعت حتى صوت فالميكرو، قرب شوية وعاود هضر بصوت واضح.');
+          } else if (now - startedAt >= 35000) {
+            if (silenceIntervalRef.current !== null) {
+              window.clearInterval(silenceIntervalRef.current);
+              silenceIntervalRef.current = null;
+            }
+            activeRec.stop();
+          }
+        }, 60);
+      }
+    } catch {
+      // If WebAudio RMS monitor fails, manual tap-to-stop still works cleanly
     }
   };
 

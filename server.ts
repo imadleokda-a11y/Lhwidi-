@@ -678,6 +678,7 @@ ${historyText}
   // --- Gemini Audio Transcription (Darija Mic) ---
   app.post('/api/transcribe', async (req: Request, res: Response) => {
     const ai = getAiClient();
+    const aiBeta = getAiClient('v1beta');
     if (!ai) {
       return res.status(503).json({ success: false, error: 'مفتاح Gemini غير مهيأ.' });
     }
@@ -686,25 +687,51 @@ ${historyText}
       if (!audioBase64) {
         return res.status(400).json({ success: false, error: 'لا يوجد تسجيل صوتي.' });
       }
-      const cleanBase64 = audioBase64.replace(/^data:[^;]+;base64,/, '');
-      const response = await withGeminiRetry(() =>
-        ai.models.generateContent({
-          model: 'gemini-3.5-transcribe',
-          contents: {
-            parts: [
-              {
-                inlineData: {
-                  mimeType: mimeType || 'audio/webm',
-                  data: cleanBase64,
-                },
-              },
-              {
-                text: 'فرغ هاد التسجيل الصوتي بالدارجة المغربية أو العربية بدقة وحافظ على مصطلحات البناء.',
-              },
-            ],
+      const b64Marker = ';base64,';
+      const markerIdx = audioBase64.indexOf(b64Marker);
+      const rawData = markerIdx !== -1 ? audioBase64.slice(markerIdx + b64Marker.length) : audioBase64.replace(/^data:[^,]*,/i, '');
+      const cleanBase64 = rawData.replace(/\s+/g, '').trim();
+      if (!cleanBase64) {
+        return res.status(400).json({ success: false, error: 'التسجيل الصوتي فارغ.' });
+      }
+      const headerMimeMatch = audioBase64.match(/^data:([^;,]+)/i);
+      let cleanMime = ((mimeType || headerMimeMatch?.[1] || 'audio/webm').split(';')[0] || 'audio/webm').trim().toLowerCase();
+      if (cleanMime === 'video/mp4' || cleanMime === 'audio/x-m4a' || cleanMime === 'audio/m4a') {
+        cleanMime = 'audio/mp4';
+      } else if (cleanMime === 'audio/x-wav') {
+        cleanMime = 'audio/wav';
+      }
+      const audioParts = [
+        {
+          inlineData: {
+            mimeType: cleanMime,
+            data: cleanBase64,
           },
-        })
-      );
+        },
+        {
+          text: 'فرغ هاد التسجيل الصوتي بالدارجة المغربية أو العربية بدقة وحافظ على مصطلحات البناء. أعد النص المسموع فقط بدون أي مقدمات أو تعليق إضافي.',
+        },
+      ];
+
+      let response;
+      try {
+        response = await generateWithModelFallback(ai, {
+          contents: { parts: audioParts },
+          config: {
+            thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+          },
+        });
+      } catch (primaryErr: unknown) {
+        if (!aiBeta) throw primaryErr;
+        response = await withGeminiRetry(() =>
+          aiBeta.models.generateContent({
+            model: 'gemini-3.5-transcribe',
+            contents: { parts: audioParts },
+            config: { abortSignal: AbortSignal.timeout(20000) } as never,
+          })
+        );
+      }
+
       return res.json({ success: true, text: (response.text || '').trim() });
     } catch (err: unknown) {
       const formatted = formatGeminiError(err, 'تعذر تحويل الصوت لنص.');
