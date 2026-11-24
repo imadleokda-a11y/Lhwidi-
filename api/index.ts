@@ -69,9 +69,107 @@ function persistCodes() {
   }
 }
 
-function getAiClient(apiVersion?: string): GoogleGenAI | null {
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
-  if (!apiKey) return null;
+interface KeyPoolState {
+  currentIdx: number;
+  keyCooldownUntil: Map<string, number>;
+  modelCooldownByKey: Map<string, Record<string, number>>;
+}
+
+const mainKeyPool: KeyPoolState = {
+  currentIdx: 0,
+  keyCooldownUntil: new Map(),
+  modelCooldownByKey: new Map(),
+};
+
+const ttsKeyPool: KeyPoolState = {
+  currentIdx: 0,
+  keyCooldownUntil: new Map(),
+  modelCooldownByKey: new Map(),
+};
+
+function getGeminiKeys(): string[] {
+  const keys: string[] = [];
+  const seen = new Set<string>();
+  const addKey = (raw: string | undefined) => {
+    const val = (raw || '').trim();
+    if (!val || val === 'MY_GEMINI_API_KEY' || seen.has(val)) return;
+    seen.add(val);
+    keys.push(val);
+  };
+
+  const numbered: Array<{ num: number; val: string }> = [];
+  for (const [envName, envVal] of Object.entries(process.env)) {
+    const match = /^GEMINI_API_KEY_(\d+)$/i.exec(envName);
+    if (match && envVal) {
+      numbered.push({ num: Number(match[1]), val: envVal });
+    }
+  }
+  numbered.sort((a, b) => a.num - b.num);
+
+  addKey(process.env.GEMINI_API_KEY);
+  for (const item of numbered) {
+    addKey(item.val);
+  }
+
+  if (process.env.GEMINI_API_KEYS) {
+    for (const part of process.env.GEMINI_API_KEYS.split(/[\s,;]+/)) {
+      addKey(part);
+    }
+  }
+
+  return keys;
+}
+
+function getOrderedKeyIndices(pool: KeyPoolState, keys: string[]): number[] {
+  const n = keys.length;
+  if (n === 0) return [];
+  const now = Date.now();
+  const start = ((pool.currentIdx % n) + n) % n;
+
+  const ready: number[] = [];
+  for (let offset = 0; offset < n; offset++) {
+    const idx = (start + offset) % n;
+    const until = pool.keyCooldownUntil.get(keys[idx]) || 0;
+    if (until <= now) {
+      ready.push(idx);
+    }
+  }
+
+  if (ready.length > 0) {
+    return ready;
+  }
+
+  // All keys hit cooldown -> wrap around cleanly back to Key 1 (index 0)
+  for (const k of keys) {
+    pool.keyCooldownUntil.delete(k);
+    pool.modelCooldownByKey.delete(k);
+  }
+  pool.currentIdx = 0;
+  return Array.from({ length: n }, (_, i) => i);
+}
+
+function getModelCooldownMap(pool: KeyPoolState, apiKey: string): Record<string, number> {
+  let map = pool.modelCooldownByKey.get(apiKey);
+  if (!map) {
+    map = {};
+    pool.modelCooldownByKey.set(apiKey, map);
+  }
+  return map;
+}
+
+function markKeyCooldown(
+  pool: KeyPoolState,
+  keys: string[],
+  keyIdx: number,
+  cooldownMs: number
+) {
+  const key = keys[keyIdx];
+  if (!key) return;
+  pool.keyCooldownUntil.set(key, Date.now() + cooldownMs);
+  pool.currentIdx = keys.length > 0 ? (keyIdx + 1) % keys.length : 0;
+}
+
+function createAiClientForKey(apiKey: string, apiVersion?: string): GoogleGenAI {
   return new GoogleGenAI({
     apiKey,
     ...(apiVersion ? { apiVersion } : {}),
@@ -220,7 +318,6 @@ function formatGeminiError(err: unknown, fallback: string): { status: number; me
 
 const TTS_CACHE_DIR = path.join(DATA_DIR, 'tts-cache');
 const ttsMemCache = new Map<string, string>();
-const ttsCooldownUntil: Record<string, number> = {};
 
 function ttsCacheKey(voiceName: string, text: string): string {
   return createHash('sha256').update(`${voiceName}::${text}`).digest('hex');
@@ -292,38 +389,64 @@ async function withGeminiRetry<T>(fn: () => Promise<T>, maxRetries = 1): Promise
   throw lastErr;
 }
 
-const modelCooldownUntil: Record<string, number> = {};
-
 function classifyGeminiFailure(err: unknown) {
   const msg = err instanceof Error ? err.message : String(err);
   const name = err instanceof Error ? err.name : '';
   const is503 = msg.includes('503') || msg.includes('UNAVAILABLE') || msg.includes('high demand');
+  const isDailyQuota =
+    msg.includes('PerDay') ||
+    msg.includes('GenerateRequestsPerDay') ||
+    msg.includes('quota_metric') ||
+    msg.includes('exceeded your current quota');
   const isQuota =
+    isDailyQuota ||
     msg.includes('429') ||
     msg.includes('RESOURCE_EXHAUSTED') ||
     msg.toLowerCase().includes('quota');
+  const isAuthError =
+    msg.includes('401') ||
+    msg.includes('403') ||
+    msg.includes('API_KEY_INVALID') ||
+    msg.includes('PERMISSION_DENIED') ||
+    msg.toLowerCase().includes('api key not valid') ||
+    msg.toLowerCase().includes('api key expired');
   const isNotFound = msg.includes('404') || msg.includes('NOT_FOUND');
   const isTimeout = name === 'TimeoutError' || name === 'AbortError' || msg.includes('aborted');
   const shouldFallback =
     isTimeout ||
     is503 ||
     isQuota ||
+    isAuthError ||
     isNotFound ||
     msg.includes('500') ||
     msg.includes('INTERNAL') ||
     msg.includes('fetch failed');
-  return { msg, is503, isQuota, isNotFound, shouldFallback };
+  return { msg, is503, isQuota, isDailyQuota, isAuthError, isNotFound, shouldFallback };
 }
 
-async function generateWithModelFallback(
+class KeyRotationSignal extends Error {
+  originalError: unknown;
+  isDailyQuota: boolean;
+  isAuthError: boolean;
+  constructor(originalError: unknown, isDailyQuota: boolean, isAuthError: boolean) {
+    super('KEY_ROTATE');
+    this.originalError = originalError;
+    this.isDailyQuota = isDailyQuota;
+    this.isAuthError = isAuthError;
+  }
+}
+
+async function generateForSingleKey(
   ai: GoogleGenAI,
+  apiKey: string,
+  hasOtherKeys: boolean,
   params: {
     contents: unknown;
     config?: Record<string, unknown>;
-    timeoutMs?: number;
-    budgetMs?: number;
-    hedgeDelayMs?: number;
-    requireText?: boolean;
+    timeoutMs: number;
+    deadlineMs: number;
+    hedgeDelayMs: number;
+    requireText: boolean;
   }
 ) {
   const defaultModels = [
@@ -333,19 +456,18 @@ async function generateWithModelFallback(
     'gemini-3-flash-preview',
     'gemini-3.5-flash',
   ];
-  const startMs = Date.now();
-  const budgetMs = params.budgetMs ?? 20000;
-  const perCallTimeout = params.timeoutMs ?? 10000;
-  const hedgeDelayMs = params.hedgeDelayMs ?? 4500;
-  const requireText = params.requireText !== false;
+  const modelCooldowns = getModelCooldownMap(mainKeyPool, apiKey);
+  const perCallTimeout = params.timeoutMs;
+  const hedgeDelayMs = params.hedgeDelayMs;
+  const requireText = params.requireText;
   const MAX_IN_FLIGHT = 2;
 
   let lastErr: unknown;
   let lastTransient503Err: unknown;
 
   const runControlledPool = async (candidates: string[]) => {
-    const remainingBudget = budgetMs - (Date.now() - startMs);
-    if (remainingBudget < 1800 || candidates.length === 0) {
+    const remainingBudget = params.deadlineMs - Date.now();
+    if (remainingBudget < 1600 || candidates.length === 0) {
       throw lastTransient503Err || lastErr || new Error('انتهت مهلة الطلب مؤقتاً، عاود حاول.');
     }
 
@@ -397,8 +519,8 @@ async function generateWithModelFallback(
         if (activeCount >= MAX_IN_FLIGHT) return;
 
         const now = Date.now();
-        const remaining = budgetMs - (now - startMs);
-        if (remaining < 1600) {
+        const remaining = params.deadlineMs - now;
+        if (remaining < 1400) {
           if (activeCount === 0) {
             clearTimers();
             settled = true;
@@ -429,7 +551,6 @@ async function generateWithModelFallback(
           baseConfig.thinkingConfig = { thinkingLevel: ThinkingLevel.MINIMAL };
         }
 
-        // Only hedge 1 backup if primary hasn't answered within hedgeDelayMs
         if (nextIdx < candidates.length && activeCount < MAX_IN_FLIGHT) {
           scheduleHedge(hedgeDelayMs);
         }
@@ -470,14 +591,23 @@ async function generateWithModelFallback(
             activeCount -= 1;
             if (settled) return;
 
-            const { is503, isQuota, isNotFound, shouldFallback } = classifyGeminiFailure(err);
+            const { is503, isQuota, isDailyQuota, isAuthError, isNotFound, shouldFallback } =
+              classifyGeminiFailure(err);
             lastErr = err;
             if (is503) lastTransient503Err = err;
 
+            if (hasOtherKeys && (isQuota || isAuthError)) {
+              settled = true;
+              clearTimers();
+              abortAll();
+              reject(new KeyRotationSignal(err, isDailyQuota, isAuthError));
+              return;
+            }
+
             if (isNotFound) {
-              modelCooldownUntil[model] = Date.now() + 600_000;
+              modelCooldowns[model] = Date.now() + 600_000;
             } else if (isQuota) {
-              modelCooldownUntil[model] = Date.now() + 15_000;
+              modelCooldowns[model] = Date.now() + 15_000;
             }
 
             if (!shouldFallback) {
@@ -502,31 +632,104 @@ async function generateWithModelFallback(
     });
   };
 
-  for (let wave = 0; wave < 2; wave++) {
-    const now = Date.now();
-    if (now - startMs >= budgetMs - 1500) break;
+  const now = Date.now();
+  const active = defaultModels.filter((m) => (modelCooldowns[m] || 0) <= now);
+  const candidates = (active.length > 0 ? active : ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite']).slice(
+    0,
+    5
+  );
 
-    const pool =
-      wave === 0
-        ? defaultModels
-        : ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.6-flash'];
-    const active = pool.filter((m) => (modelCooldownUntil[m] || 0) <= now);
-    const candidates = (active.length > 0 ? active : ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite']).slice(
-      0,
-      wave === 0 ? 5 : 2
-    );
+  return runControlledPool(candidates);
+}
+
+async function generateWithModelFallback(
+  params: {
+    contents: unknown;
+    config?: Record<string, unknown>;
+    timeoutMs?: number;
+    budgetMs?: number;
+    hedgeDelayMs?: number;
+    requireText?: boolean;
+  }
+) {
+  const keys = getGeminiKeys();
+  if (keys.length === 0) {
+    throw new Error('مفتاح Gemini AI غير مهيأ حالياً في الخادم.');
+  }
+
+  const startMs = Date.now();
+  const budgetMs = params.budgetMs ?? 20000;
+  const deadlineMs = startMs + budgetMs;
+  const perCallTimeout = params.timeoutMs ?? 10000;
+  const hedgeDelayMs = params.hedgeDelayMs ?? 4500;
+  const requireText = params.requireText !== false;
+
+  const order = getOrderedKeyIndices(mainKeyPool, keys);
+  let lastErr: unknown;
+  let lastTransient503Err: unknown;
+
+  for (let i = 0; i < order.length; i++) {
+    if (Date.now() >= deadlineMs - 1200) break;
+    const keyIdx = order[i];
+    const apiKey = keys[keyIdx];
+    const hasOtherKeys = i + 1 < order.length || keys.length > 1;
+    const ai = createAiClientForKey(apiKey);
 
     try {
-      return await runControlledPool(candidates);
+      const res = await generateForSingleKey(ai, apiKey, hasOtherKeys, {
+        contents: params.contents,
+        config: params.config,
+        timeoutMs: perCallTimeout,
+        deadlineMs,
+        hedgeDelayMs,
+        requireText,
+      });
+      mainKeyPool.currentIdx = keyIdx;
+      return res;
     } catch (err: unknown) {
-      lastErr = err;
-      const { shouldFallback } = classifyGeminiFailure(err);
-      if (!shouldFallback) throw err;
-      if (Date.now() - startMs + 3500 < budgetMs) {
-        await new Promise((r) => setTimeout(r, 400));
-      } else {
-        break;
+      if (err instanceof KeyRotationSignal) {
+        lastErr = err.originalError;
+        const cooldownMs = err.isDailyQuota || err.isAuthError ? 900_000 : 60_000;
+        markKeyCooldown(mainKeyPool, keys, keyIdx, cooldownMs);
+        continue;
       }
+
+      lastErr = err;
+      const { is503, isQuota, isDailyQuota, isAuthError, shouldFallback } =
+        classifyGeminiFailure(err);
+      if (is503) lastTransient503Err = err;
+
+      if (!shouldFallback) {
+        throw err;
+      }
+
+      if (isQuota || isAuthError) {
+        markKeyCooldown(mainKeyPool, keys, keyIdx, isDailyQuota || isAuthError ? 900_000 : 60_000);
+        continue;
+      }
+
+      if (i + 1 < order.length && Date.now() < deadlineMs - 3000) {
+        continue;
+      }
+      break;
+    }
+  }
+
+  // If single-key or all keys exhausted within budget, try one brief wrap-around retry when single-key 503
+  if (keys.length === 1 && Date.now() + 3500 < deadlineMs) {
+    await new Promise((r) => setTimeout(r, 400));
+    const ai = createAiClientForKey(keys[0]);
+    try {
+      return await generateForSingleKey(ai, keys[0], false, {
+        contents: params.contents,
+        config: params.config,
+        timeoutMs: perCallTimeout,
+        deadlineMs,
+        hedgeDelayMs,
+        requireText,
+      });
+    } catch (retryErr: unknown) {
+      lastErr = retryErr;
     }
   }
 
@@ -629,9 +832,11 @@ export function createApiApp(): Express {
   });
 
   app.get('/api/health', (_req: Request, res: Response) => {
+    const keys = getGeminiKeys();
     res.json({
       ok: true,
-      aiConfigured: Boolean(process.env.GEMINI_API_KEY?.trim()),
+      aiConfigured: keys.length > 0,
+      keysCount: keys.length,
       runtime: IS_VERCEL ? 'vercel' : 'node',
     });
   });
@@ -767,8 +972,7 @@ export function createApiApp(): Express {
 
   // --- Gemini Vision: Blueprint Analysis ---
   app.post('/api/analyze-plan', async (req: Request, res: Response) => {
-    const ai = getAiClient();
-    if (!ai) {
+    if (getGeminiKeys().length === 0) {
       return res.status(503).json({
         success: false,
         error: 'مفتاح Gemini AI غير مهيأ حالياً في الخادم (Settings > Secrets).',
@@ -820,7 +1024,7 @@ ${finalNotes ? `ملاحظة صاحب البلان: ${finalNotes}` : ''}
   "warnings": ["تنبيه"]
 }`;
 
-      const response = await generateWithModelFallback(ai, {
+      const response = await generateWithModelFallback({
         contents: {
           parts: [
             { inlineData: imagePart },
@@ -846,8 +1050,7 @@ ${finalNotes ? `ملاحظة صاحب البلان: ${finalNotes}` : ''}
 
   // --- Gemini Vision + Chat: Smart Maâlem Follow-Up Q&A ---
   app.post('/api/chat-plan', async (req: Request, res: Response) => {
-    const ai = getAiClient();
-    if (!ai) {
+    if (getGeminiKeys().length === 0) {
       return res.status(503).json({ success: false, error: 'مفتاح Gemini غير مهيأ.' });
     }
     try {
@@ -899,7 +1102,7 @@ ${historyText}
 
       let response;
       try {
-        response = await generateWithModelFallback(ai, {
+        response = await generateWithModelFallback({
           contents: { parts },
           timeoutMs: 9500,
           budgetMs: 18500,
@@ -907,7 +1110,7 @@ ${historyText}
         });
       } catch (visionChatErr: unknown) {
         if (parts.length > 1 && analysisContext) {
-          response = await generateWithModelFallback(ai, {
+          response = await generateWithModelFallback({
             contents: { parts: [{ text: promptText }] },
             timeoutMs: 8000,
             budgetMs: 14000,
@@ -927,8 +1130,7 @@ ${historyText}
 
   // --- Gemini Vision: AI Crack Detector ---
   app.post('/api/detect-cracks', async (req: Request, res: Response) => {
-    const ai = getAiClient();
-    if (!ai) {
+    if (getGeminiKeys().length === 0) {
       return res.status(503).json({ success: false, error: 'مفتاح Gemini غير مهيأ.' });
     }
     try {
@@ -958,7 +1160,7 @@ ${historyText}
   "audioScript": "نص الشرح الصوتي بالدارجة"
 }`;
 
-      const response = await generateWithModelFallback(ai, {
+      const response = await generateWithModelFallback({
         contents: {
           parts: [
             { inlineData: imagePart },
@@ -983,9 +1185,8 @@ ${historyText}
 
   // --- Gemini Audio Transcription (Verbatim Darija Arabic-Script Only) ---
   app.post('/api/transcribe', async (req: Request, res: Response) => {
-    const ai = getAiClient();
-    const aiBeta = getAiClient('v1beta');
-    if (!ai) {
+    const keys = getGeminiKeys();
+    if (keys.length === 0) {
       return res.status(503).json({ success: false, error: 'مفتاح Gemini غير مهيأ.' });
     }
     try {
@@ -1032,9 +1233,41 @@ ${historyText}
         },
       ];
 
+      const callTranscribeBetaWithRotation = async (): Promise<string> => {
+        const order = getOrderedKeyIndices(mainKeyPool, keys);
+        let lastBetaErr: unknown;
+        for (const keyIdx of order) {
+          const aiBeta = createAiClientForKey(keys[keyIdx], 'v1beta');
+          try {
+            const betaResp = await withGeminiRetry(
+              () =>
+                aiBeta.models.generateContent({
+                  model: 'gemini-3.5-transcribe',
+                  contents: { parts: audioParts },
+                  config: {
+                    abortSignal: AbortSignal.timeout(10000),
+                  } as never,
+                }),
+              keys.length > 1 ? 0 : 1
+            );
+            mainKeyPool.currentIdx = keyIdx;
+            return betaResp.text || '';
+          } catch (err: unknown) {
+            lastBetaErr = err;
+            const { isQuota, isDailyQuota, isAuthError, shouldFallback } = classifyGeminiFailure(err);
+            if (isQuota || isAuthError) {
+              markKeyCooldown(mainKeyPool, keys, keyIdx, isDailyQuota || isAuthError ? 900_000 : 60_000);
+              continue;
+            }
+            if (!shouldFallback) throw err;
+          }
+        }
+        throw lastBetaErr;
+      };
+
       let rawText = '';
       try {
-        const response = await generateWithModelFallback(ai, {
+        const response = await generateWithModelFallback({
           contents: { parts: audioParts },
           timeoutMs: 8000,
           budgetMs: 16500,
@@ -1042,31 +1275,15 @@ ${historyText}
           requireText: false,
         });
         rawText = response.text || '';
-      } catch (primaryErr: unknown) {
-        if (!aiBeta) throw primaryErr;
-        const betaResp = await withGeminiRetry(() =>
-          aiBeta.models.generateContent({
-            model: 'gemini-3.5-transcribe',
-            contents: { parts: audioParts },
-            config: {
-              abortSignal: AbortSignal.timeout(12000),
-            } as never,
-          })
-        );
-        rawText = betaResp.text || '';
+      } catch {
+        rawText = await callTranscribeBetaWithRotation();
       }
 
-      if (/[\u0900-\u097F]/.test(rawText) && aiBeta) {
+      if (/[\u0900-\u097F]/.test(rawText)) {
         try {
-          const betaResp = await aiBeta.models.generateContent({
-            model: 'gemini-3.5-transcribe',
-            contents: { parts: audioParts },
-            config: {
-              abortSignal: AbortSignal.timeout(10000),
-            } as never,
-          });
-          if (betaResp.text && !/[\u0900-\u097F]/.test(betaResp.text)) {
-            rawText = betaResp.text;
+          const betaText = await callTranscribeBetaWithRotation();
+          if (betaText && !/[\u0900-\u097F]/.test(betaText)) {
+            rawText = betaText;
           }
         } catch {
           // fall through to sanitizer
@@ -1082,8 +1299,7 @@ ${historyText}
 
   // --- Voice Idea Summary ---
   app.post('/api/voice-idea-summary', async (req: Request, res: Response) => {
-    const ai = getAiClient();
-    if (!ai) {
+    if (getGeminiKeys().length === 0) {
       return res.status(503).json({ success: false, error: 'مفتاح Gemini غير مهيأ.' });
     }
     try {
@@ -1091,7 +1307,7 @@ ${historyText}
       if (!rawIdea) {
         return res.status(400).json({ success: false, error: 'النص فارغ.' });
       }
-      const response = await generateWithModelFallback(ai, {
+      const response = await generateWithModelFallback({
         contents: `رتب هاد الملاحظة الصوتية ديال الشانطي بالدارجة المغربية فـ عنوان قصير ولائحة منظمة ديال السلعة أو الخدمة المطلوبة:\n"${rawIdea}"\n\nأرجع JSON فقط بهذا الشكل: {"title":"عنوان قصير","structuredDarija":"النص المنظم بالدارجة"}`,
         timeoutMs: 8500,
         budgetMs: 17000,
@@ -1112,10 +1328,10 @@ ${historyText}
     }
   });
 
-  // --- Moroccan Darija TTS (Gemini 3.8 TTS with cache & quota cooldown — DO NOT ALTER) ---
+  // --- Moroccan Darija TTS (Gemini 3.8 TTS with cache & multi-key quota rotation — voices/prompts unchanged) ---
   app.post('/api/tts', async (req: Request, res: Response) => {
-    const ai = getAiClient('v1beta');
-    if (!ai) {
+    const keys = getGeminiKeys();
+    if (keys.length === 0) {
       return res.status(503).json({ ok: false, reason: 'no_keys', message: 'خدمة الصوت السحابي غير مهيأة.' });
     }
     try {
@@ -1144,88 +1360,118 @@ ${historyText}
         : 'Speak strictly in authentic Moroccan Darija (الدارجة المغربية), clear friendly Moroccan female architect engineer (سلمى المهندسة) accent, natural pace.';
 
       const ttsModels = ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts'];
-      const now = Date.now();
+      const order = getOrderedKeyIndices(ttsKeyPool, keys);
       let audioBase64: string | undefined;
       let lastErr: unknown;
 
-      for (const model of ttsModels) {
-        if ((ttsCooldownUntil[model] || 0) > now) {
-          continue;
-        }
-        try {
-          let response;
+      for (const keyIdx of order) {
+        const apiKey = keys[keyIdx];
+        const ai = createAiClientForKey(apiKey, 'v1beta');
+        const ttsCooldownUntil = getModelCooldownMap(ttsKeyPool, apiKey);
+        const retryCount = keys.length > 1 ? 0 : 1;
+        let keyExhausted = false;
+
+        for (const model of ttsModels) {
+          if ((ttsCooldownUntil[model] || 0) > Date.now()) {
+            continue;
+          }
           try {
-            response = await withGeminiRetry(() =>
-              ai.models.generateContent({
-                model,
-                contents: [
-                  {
-                    role: 'user',
-                    parts: [
+            let response;
+            try {
+              response = await withGeminiRetry(
+                () =>
+                  ai.models.generateContent({
+                    model,
+                    contents: [
                       {
-                        text,
-                        speechMetadata: {
-                          style: stylePrompt,
-                        },
+                        role: 'user',
+                        parts: [
+                          {
+                            text,
+                            speechMetadata: {
+                              style: stylePrompt,
+                            },
+                          },
+                        ],
                       },
                     ],
-                  },
-                ],
-                config: {
-                  responseModalities: ['AUDIO'],
-                  speechConfig: {
-                    voiceConfig: {
-                      prebuiltVoiceConfig: { voiceName },
-                    },
-                  },
-                },
-              })
-            );
-          } catch (innerErr: unknown) {
-            const innerMsg = innerErr instanceof Error ? innerErr.message : '';
-            if (innerMsg.includes('speechMetadata')) {
-              response = await withGeminiRetry(() =>
-                ai.models.generateContent({
-                  model,
-                  contents: [
-                    {
-                      role: 'user',
-                      parts: [{ text: `${stylePrompt}\n\n${text}` }],
-                    },
-                  ],
-                  config: {
-                    responseModalities: ['AUDIO'],
-                    speechConfig: {
-                      voiceConfig: {
-                        prebuiltVoiceConfig: { voiceName },
+                    config: {
+                      responseModalities: ['AUDIO'],
+                      speechConfig: {
+                        voiceConfig: {
+                          prebuiltVoiceConfig: { voiceName },
+                        },
                       },
                     },
-                  },
-                })
+                  }),
+                retryCount
               );
-            } else {
-              throw innerErr;
+            } catch (innerErr: unknown) {
+              const innerMsg = innerErr instanceof Error ? innerErr.message : '';
+              if (innerMsg.includes('speechMetadata')) {
+                response = await withGeminiRetry(
+                  () =>
+                    ai.models.generateContent({
+                      model,
+                      contents: [
+                        {
+                          role: 'user',
+                          parts: [{ text: `${stylePrompt}\n\n${text}` }],
+                        },
+                      ],
+                      config: {
+                        responseModalities: ['AUDIO'],
+                        speechConfig: {
+                          voiceConfig: {
+                            prebuiltVoiceConfig: { voiceName },
+                          },
+                        },
+                      },
+                    }),
+                  retryCount
+                );
+              } else {
+                throw innerErr;
+              }
             }
-          }
 
-          audioBase64 = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-          if (audioBase64) break;
-        } catch (modelErr: unknown) {
-          lastErr = modelErr;
-          const m = modelErr instanceof Error ? modelErr.message : String(modelErr);
-          const isQuota =
-            m.includes('429') ||
-            m.toLowerCase().includes('quota') ||
-            m.includes('RESOURCE_EXHAUSTED');
-          if (isQuota) {
-            ttsCooldownUntil[model] = Date.now() + 45_000;
-            continue;
+            audioBase64 = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+            if (audioBase64) break;
+          } catch (modelErr: unknown) {
+            lastErr = modelErr;
+            const { is503, isQuota, isDailyQuota, isAuthError } = classifyGeminiFailure(modelErr);
+            if (isQuota || isAuthError) {
+              ttsCooldownUntil[model] = Date.now() + 45_000;
+              if (keys.length > 1 && (isDailyQuota || isAuthError)) {
+                markKeyCooldown(ttsKeyPool, keys, keyIdx, 900_000);
+                keyExhausted = true;
+                break;
+              }
+              continue;
+            }
+            if (is503) {
+              ttsCooldownUntil[model] = Date.now() + 20_000;
+              continue;
+            }
+            throw modelErr;
           }
-          if (m.includes('503') || m.includes('UNAVAILABLE') || m.includes('high demand')) {
-            ttsCooldownUntil[model] = Date.now() + 20_000;
-            continue;
+        }
+
+        if (audioBase64) {
+          ttsKeyPool.currentIdx = keyIdx;
+          break;
+        }
+
+        if (!keyExhausted && lastErr) {
+          const { isQuota, isDailyQuota, isAuthError } = classifyGeminiFailure(lastErr);
+          if (isQuota || isAuthError) {
+            markKeyCooldown(
+              ttsKeyPool,
+              keys,
+              keyIdx,
+              isDailyQuota || isAuthError ? 900_000 : 60_000
+            );
           }
-          throw modelErr;
         }
       }
 
