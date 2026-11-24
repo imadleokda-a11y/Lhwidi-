@@ -192,6 +192,16 @@ const MainAppShell: React.FC = () => {
     { id: 'settings', label: 'الضبط', icon: Settings },
   ];
 
+  const triggerNavHaptic = () => {
+    try {
+      if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+        navigator.vibrate(12);
+      }
+    } catch {
+      // Ignore unsupported environments
+    }
+  };
+
   return (
     <div className="min-h-screen bg-[#0a0f1e] blueprint-grid text-slate-100 flex flex-col">
       <header className="sticky top-0 z-30 h-14 border-b border-white/10 bg-[#0a0f1e]/90 backdrop-blur-md">
@@ -365,8 +375,11 @@ const MainAppShell: React.FC = () => {
               <button
                 key={item.id}
                 type="button"
-                onClick={() => setActiveTab(item.id)}
-                className={`min-h-[44px] flex flex-col items-center justify-center gap-1 transition-colors ${
+                onClick={() => {
+                  triggerNavHaptic();
+                  setActiveTab(item.id);
+                }}
+                className={`min-h-[44px] flex flex-col items-center justify-center gap-1 transition-all duration-150 active:scale-90 ${
                   active ? 'text-[#ff7a1a]' : 'text-slate-400 hover:text-slate-200'
                 }`}
               >

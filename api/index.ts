@@ -2,7 +2,7 @@ import express, { type Express, type Request, type Response } from 'express';
 import fs from 'fs';
 import path from 'path';
 import { createHash } from 'crypto';
-import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 
 const ROOT_DIR = process.cwd();
 const IS_VERCEL = Boolean(process.env.VERCEL);
@@ -101,9 +101,109 @@ function parseCleanJson<T>(rawText: string | undefined): T {
   }
 }
 
+function normalizeBlueprintAnalysis(raw: Record<string, unknown>) {
+  const isBlueprint = raw.isBlueprint !== false;
+  const roomsRaw = Array.isArray(raw.rooms) ? raw.rooms : [];
+  const materialsRaw = Array.isArray(raw.materials) ? raw.materials : [];
+  const phasesRaw = Array.isArray(raw.phases) ? raw.phases : [];
+  const warningsRaw = Array.isArray(raw.warnings) ? raw.warnings : [];
+
+  const rooms = roomsRaw.map((r: unknown) => {
+    const item = (r && typeof r === 'object' ? r : {}) as Record<string, unknown>;
+    return {
+      name: String(item.name || 'فضاء / غرفة'),
+      dimensions: String(item.dimensions || 'حسب المخطط'),
+      areaSqm: String(item.areaSqm || '-'),
+      notes: item.notes ? String(item.notes) : undefined,
+    };
+  });
+
+  const materials = materialsRaw.map((m: unknown) => {
+    const item = (m && typeof m === 'object' ? m : {}) as Record<string, unknown>;
+    return {
+      name: String(item.name || 'مادة بناء'),
+      quantity: String(item.quantity || '-'),
+      unit: String(item.unit || ''),
+      notes: item.notes ? String(item.notes) : undefined,
+    };
+  });
+
+  const phases = phasesRaw.map((p: unknown, idx: number) => {
+    const item = (p && typeof p === 'object' ? p : {}) as Record<string, unknown>;
+    return {
+      stepNumber: Number(item.stepNumber) || idx + 1,
+      phaseName: String(item.phaseName || `المرحلة ${idx + 1}`),
+      explanationDarija: String(item.explanationDarija || ''),
+    };
+  });
+
+  const warnings = warningsRaw.map((w: unknown) => String(w || '')).filter(Boolean);
+  const darijaSummary = String(
+    raw.darijaSummary ||
+      raw.audioScript ||
+      (isBlueprint
+        ? 'تمت قراءة المخطط الهندسي واستخراج التفاصيل الأساسية بالدارجة.'
+        : 'هادي ماشي صورة ديال بلان البناء، عافاك صور المخطط بشكل واضح.')
+  );
+  const audioScript = String(raw.audioScript || darijaSummary);
+
+  return {
+    isBlueprint,
+    title: String(raw.title || (isBlueprint ? 'تحليل مخطط البناء' : 'صورة غير مطابقة للبلان')),
+    buildingType: String(raw.buildingType || (isBlueprint ? 'مشروع بناء' : '-')),
+    totalAreaSqm: String(raw.totalAreaSqm || '-'),
+    roomsCount: Number(raw.roomsCount) || rooms.length,
+    darijaSummary,
+    audioScript,
+    structuralNotes: raw.structuralNotes ? String(raw.structuralNotes) : '',
+    rooms,
+    materials,
+    phases,
+    warnings,
+  };
+}
+
+function normalizeCrackDiagnosis(raw: Record<string, unknown>) {
+  const sevRaw = String(raw.severity || 'moderate').toLowerCase();
+  const severity: 'surface' | 'moderate' | 'structural' =
+    sevRaw === 'surface' || sevRaw === 'structural' ? sevRaw : 'moderate';
+  const repairSteps = Array.isArray(raw.repairSteps)
+    ? raw.repairSteps.map((s) => String(s || '')).filter(Boolean)
+    : [];
+  const diagnosisDarija = String(
+    raw.diagnosisDarija || 'تشخيص أولي للشق فالحيط أو الضالة حسب الصورة المرسلة.'
+  );
+  return {
+    severity,
+    severityLabelDarija: String(
+      raw.severityLabelDarija ||
+        (severity === 'surface'
+          ? 'شق سطحي بسيط'
+          : severity === 'structural'
+            ? 'شق إنشائي خطير'
+            : 'شق متوسط خاصو مراقبة')
+    ),
+    diagnosisDarija,
+    causeDarija: String(raw.causeDarija || 'تفاوت الحرارة أو حركة خفيفة فالبني أو المرطوب.'),
+    repairSteps:
+      repairSteps.length > 0
+        ? repairSteps
+        : ['نظف الشق مزيان من الغبرة', 'عالج الشق بمادة السيكافليكس أو مورطي مناسب', 'عاود المرطوب والصباغة بعد النشوف'],
+    audioScript: String(raw.audioScript || diagnosisDarija),
+  };
+}
+
 function formatGeminiError(err: unknown, fallback: string): { status: number; message: string } {
   const raw = err instanceof Error ? err.message : String(err || fallback);
-  if (raw.includes('503') || raw.includes('UNAVAILABLE') || raw.includes('high demand')) {
+  const name = err instanceof Error ? err.name : '';
+  if (
+    name === 'AbortError' ||
+    name === 'TimeoutError' ||
+    raw.includes('aborted') ||
+    raw.includes('503') ||
+    raw.includes('UNAVAILABLE') ||
+    raw.includes('high demand')
+  ) {
     return {
       status: 503,
       message: 'السيرفر ديال الذكاء الاصطناعي عليه ضغط مؤقت دابا، تسنا ثواني وعاود جرب.',
@@ -194,75 +294,242 @@ async function withGeminiRetry<T>(fn: () => Promise<T>, maxRetries = 1): Promise
 
 const modelCooldownUntil: Record<string, number> = {};
 
+function classifyGeminiFailure(err: unknown) {
+  const msg = err instanceof Error ? err.message : String(err);
+  const name = err instanceof Error ? err.name : '';
+  const is503 = msg.includes('503') || msg.includes('UNAVAILABLE') || msg.includes('high demand');
+  const isQuota =
+    msg.includes('429') ||
+    msg.includes('RESOURCE_EXHAUSTED') ||
+    msg.toLowerCase().includes('quota');
+  const isNotFound = msg.includes('404') || msg.includes('NOT_FOUND');
+  const isTimeout = name === 'TimeoutError' || name === 'AbortError' || msg.includes('aborted');
+  const shouldFallback =
+    isTimeout ||
+    is503 ||
+    isQuota ||
+    isNotFound ||
+    msg.includes('500') ||
+    msg.includes('INTERNAL') ||
+    msg.includes('fetch failed');
+  return { msg, is503, isQuota, isNotFound, shouldFallback };
+}
+
 async function generateWithModelFallback(
   ai: GoogleGenAI,
   params: {
     contents: unknown;
     config?: Record<string, unknown>;
     timeoutMs?: number;
+    budgetMs?: number;
+    hedgeDelayMs?: number;
+    requireText?: boolean;
   }
 ) {
-  const models = [
+  const defaultModels = [
     'gemini-3.5-flash-lite',
     'gemini-3.1-flash-lite',
-    'gemini-3.8-flash',
-    'gemini-4-hydrogen',
+    'gemini-3.6-flash',
+    'gemini-3-flash-preview',
+    'gemini-3.5-flash',
   ];
-  const now = Date.now();
-  const activeModels = models.filter((m) => (modelCooldownUntil[m] || 0) <= now);
-  const candidates = activeModels.length > 0 ? activeModels : [...models];
+  const startMs = Date.now();
+  const budgetMs = params.budgetMs ?? 20000;
+  const perCallTimeout = params.timeoutMs ?? 10000;
+  const hedgeDelayMs = params.hedgeDelayMs ?? 4500;
+  const requireText = params.requireText !== false;
+  const MAX_IN_FLIGHT = 2;
 
   let lastErr: unknown;
   let lastTransient503Err: unknown;
-  for (let pass = 0; pass < 2; pass++) {
-    for (const model of candidates) {
-      if (pass === 1 && model === 'gemini-4-hydrogen') continue;
-      if ((modelCooldownUntil[model] || 0) > Date.now()) continue;
-      try {
-        const baseConfig = { ...(params.config || {}) };
-        if (model === 'gemini-3.1-flash-lite' && baseConfig.thinkingConfig) {
+
+  const runControlledPool = async (candidates: string[]) => {
+    const remainingBudget = budgetMs - (Date.now() - startMs);
+    if (remainingBudget < 1800 || candidates.length === 0) {
+      throw lastTransient503Err || lastErr || new Error('انتهت مهلة الطلب مؤقتاً، عاود حاول.');
+    }
+
+    return new Promise<Awaited<ReturnType<typeof ai.models.generateContent>>>((resolve, reject) => {
+      let settled = false;
+      let nextIdx = 0;
+      let activeCount = 0;
+      const controllers: AbortController[] = [];
+      let hedgeTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const clearTimers = () => {
+        if (hedgeTimer !== null) {
+          clearTimeout(hedgeTimer);
+          hedgeTimer = null;
+        }
+      };
+
+      const abortAll = () => {
+        for (const c of controllers) {
+          try {
+            c.abort();
+          } catch {
+            // ignore
+          }
+        }
+      };
+
+      const scheduleHedge = (delay: number) => {
+        clearTimers();
+        if (settled || nextIdx >= candidates.length || activeCount >= MAX_IN_FLIGHT) return;
+        hedgeTimer = setTimeout(() => {
+          hedgeTimer = null;
+          if (!settled && nextIdx < candidates.length && activeCount < MAX_IN_FLIGHT) {
+            launchNext();
+          }
+        }, delay);
+      };
+
+      const launchNext = () => {
+        if (settled) return;
+        if (nextIdx >= candidates.length) {
+          if (activeCount === 0) {
+            clearTimers();
+            settled = true;
+            reject(lastTransient503Err || lastErr);
+          }
+          return;
+        }
+        if (activeCount >= MAX_IN_FLIGHT) return;
+
+        const now = Date.now();
+        const remaining = budgetMs - (now - startMs);
+        if (remaining < 1600) {
+          if (activeCount === 0) {
+            clearTimers();
+            settled = true;
+            reject(lastTransient503Err || lastErr || new Error('انتهت مهلة الطلب مؤقتاً، عاود حاول.'));
+          }
+          return;
+        }
+
+        const model = candidates[nextIdx++];
+        activeCount += 1;
+
+        const ctrl = new AbortController();
+        controllers.push(ctrl);
+
+        const callTimeout = Math.max(3500, Math.min(perCallTimeout, remaining));
+        const timeoutId = setTimeout(() => {
+          try {
+            ctrl.abort();
+          } catch {
+            // ignore
+          }
+        }, callTimeout);
+
+        const baseConfig: Record<string, unknown> = { ...(params.config || {}) };
+        if (model === 'gemini-3.6-flash' && baseConfig.thinkingConfig) {
+          delete baseConfig.thinkingConfig;
+        } else if (model === 'gemini-3.1-flash-lite' && baseConfig.thinkingConfig) {
           baseConfig.thinkingConfig = { thinkingLevel: ThinkingLevel.MINIMAL };
-        } else if (model === 'gemini-4-hydrogen' && baseConfig.thinkingConfig) {
-          baseConfig.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
         }
-        return await ai.models.generateContent({
-          model,
-          contents: params.contents as never,
-          config: {
-            ...baseConfig,
-            abortSignal: AbortSignal.timeout(params.timeoutMs ?? 25000),
-          } as never,
-        });
-      } catch (err: unknown) {
-        lastErr = err;
-        const msg = err instanceof Error ? err.message : String(err);
-        const name = err instanceof Error ? err.name : '';
-        const is503 = msg.includes('503') || msg.includes('UNAVAILABLE') || msg.includes('high demand');
-        if (is503) lastTransient503Err = err;
-        const shouldFallback =
-          name === 'TimeoutError' ||
-          name === 'AbortError' ||
-          is503 ||
-          msg.includes('aborted') ||
-          msg.includes('429') ||
-          msg.includes('RESOURCE_EXHAUSTED') ||
-          msg.toLowerCase().includes('quota') ||
-          msg.includes('404') ||
-          msg.includes('NOT_FOUND') ||
-          msg.includes('500') ||
-          msg.includes('INTERNAL');
-        if (!shouldFallback) {
-          throw err;
+
+        // Only hedge 1 backup if primary hasn't answered within hedgeDelayMs
+        if (nextIdx < candidates.length && activeCount < MAX_IN_FLIGHT) {
+          scheduleHedge(hedgeDelayMs);
         }
-        if (msg.includes('404') || msg.includes('NOT_FOUND') || msg.includes('PerDay')) {
-          modelCooldownUntil[model] = Date.now() + 120_000;
-        }
+
+        ai.models
+          .generateContent({
+            model,
+            contents: params.contents as never,
+            config: {
+              ...baseConfig,
+              abortSignal: ctrl.signal,
+            } as never,
+          })
+          .then((res) => {
+            clearTimeout(timeoutId);
+            activeCount -= 1;
+            if (settled) return;
+
+            if (requireText && (!res || !String(res.text || '').trim())) {
+              lastErr = new Error('رد فارغ من النموذج');
+              if (nextIdx < candidates.length) {
+                launchNext();
+              } else if (activeCount === 0) {
+                clearTimers();
+                settled = true;
+                reject(lastTransient503Err || lastErr);
+              }
+              return;
+            }
+
+            settled = true;
+            clearTimers();
+            abortAll();
+            resolve(res);
+          })
+          .catch((err: unknown) => {
+            clearTimeout(timeoutId);
+            activeCount -= 1;
+            if (settled) return;
+
+            const { is503, isQuota, isNotFound, shouldFallback } = classifyGeminiFailure(err);
+            lastErr = err;
+            if (is503) lastTransient503Err = err;
+
+            if (isNotFound) {
+              modelCooldownUntil[model] = Date.now() + 600_000;
+            } else if (isQuota) {
+              modelCooldownUntil[model] = Date.now() + 15_000;
+            }
+
+            if (!shouldFallback) {
+              settled = true;
+              clearTimers();
+              abortAll();
+              reject(err);
+              return;
+            }
+
+            if (nextIdx < candidates.length) {
+              launchNext();
+            } else if (activeCount === 0) {
+              clearTimers();
+              settled = true;
+              reject(lastTransient503Err || lastErr);
+            }
+          });
+      };
+
+      launchNext();
+    });
+  };
+
+  for (let wave = 0; wave < 2; wave++) {
+    const now = Date.now();
+    if (now - startMs >= budgetMs - 1500) break;
+
+    const pool =
+      wave === 0
+        ? defaultModels
+        : ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.6-flash'];
+    const active = pool.filter((m) => (modelCooldownUntil[m] || 0) <= now);
+    const candidates = (active.length > 0 ? active : ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite']).slice(
+      0,
+      wave === 0 ? 5 : 2
+    );
+
+    try {
+      return await runControlledPool(candidates);
+    } catch (err: unknown) {
+      lastErr = err;
+      const { shouldFallback } = classifyGeminiFailure(err);
+      if (!shouldFallback) throw err;
+      if (Date.now() - startMs + 3500 < budgetMs) {
+        await new Promise((r) => setTimeout(r, 400));
+      } else {
+        break;
       }
     }
-    if (pass === 0) {
-      await new Promise((resolve) => setTimeout(resolve, 750));
-    }
   }
+
   throw lastTransient503Err || lastErr;
 }
 
@@ -272,7 +539,6 @@ function resolveImagePart(
 ): { mimeType: string; data: string } | null {
   if (!imageBase64OrUrl) return null;
 
-  // Case 1: Data URL
   if (imageBase64OrUrl.startsWith('data:')) {
     const b64Idx = imageBase64OrUrl.indexOf(';base64,');
     if (b64Idx !== -1) {
@@ -287,7 +553,6 @@ function resolveImagePart(
     }
   }
 
-  // Case 2: Local sample asset path like /src/assets/images/...
   if (imageBase64OrUrl.startsWith('/src/assets/') || imageBase64OrUrl.startsWith('/assets/')) {
     const relPath = imageBase64OrUrl.replace(/^\/+/, '');
     const candidates = [
@@ -313,7 +578,6 @@ function resolveImagePart(
     }
   }
 
-  // Case 3: Raw base64 string
   if (!imageBase64OrUrl.startsWith('http')) {
     const clean = imageBase64OrUrl.replace(/\s+/g, '').trim();
     if (clean) {
@@ -346,7 +610,24 @@ export function createApiApp(): Express {
   app.set('trust proxy', 1);
   app.use(express.json({ limit: '25mb' }));
 
-  // Health check
+  app.use((req, res, next) => {
+    // Restore original /api/... path if Vercel rewrite forwards /api/index or /api/index.ts
+    if (req.url === '/api/index' || req.url.startsWith('/api/index.ts') || req.url.startsWith('/api/index?')) {
+      const origHeader =
+        req.headers['x-vercel-original-url'] ||
+        req.headers['x-forwarded-uri'] ||
+        req.headers['x-invoke-path'];
+      const orig = Array.isArray(origHeader) ? origHeader[0] : origHeader;
+      if (typeof orig === 'string' && orig.startsWith('/api/') && !orig.startsWith('/api/index')) {
+        req.url = orig;
+      }
+    }
+    if (req.url.startsWith('/api/')) {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    }
+    next();
+  });
+
   app.get('/api/health', (_req: Request, res: Response) => {
     res.json({
       ok: true,
@@ -515,14 +796,29 @@ export function createApiApp(): Express {
         return res.status(400).json({ success: false, error: 'صيغة الصورة غير صالحة.' });
       }
 
-      const prompt = `أنت "المعلم الذكي" — مهندس معماري ومقاول مغربي خبير فـ قراءة مخططات البناء (بلان ديال الدار، الفيلات، السواري، الضالة، الحديد، الكهرباء والترصيص).
-قم بتحليل هذه الصورة بدقة وأجب بالدارجة المغربية الواضحة والمفهومة بالحروف العربية (بدون حروف فرنسية وسط الجمل إلا للمصطلحات الضرورية مثل R+1 أو CPJ45 أو 6/8/12).
+      const prompt = `أنت "المعلم الذكي" — مهندس ومقاول مغربي خبير فـ قراءة مخططات البناء (بلان الدار، الفيلات، السواري، الضالة، الحديد).
+حلل الصورة بإيجاز عملي وواضح بالدارجة المغربية بالحروف العربية فقط (باستثناء رموز مثل R+1 أو T10/T12).
 ${finalNotes ? `ملاحظة صاحب البلان: ${finalNotes}` : ''}
 
-تأكد من:
-1. إذا كانت الصورة ليست مخطط بناء أو ورقة تقنية (مثلا صورة عادية أو وجه أو طبيعة)، ضع isBlueprint = false واشرح بالدارجة بلطف أنها ليست بلان بناء.
-2. إذا كانت بلان بناء أو حديد: استخرج كل الغرف والمساحات والأبعاد المكتوبة بدقة، وتفاصيل السواري والحديد إذا وجدت، وقدم تقديراً واقعياً لمواد البناء (السيما، الحديد، الرملة، الكياس، البريك)، ومراحل الخدمة بالترتيب، وتنبيهات مهمة للمعلم والزبون.
-3. اكتب "audioScript" بصيغة طبيعية سلسة بالدارجة المغربية بحال يلا كتشرح بالصوت لصاحب الدار أو المعلم (باستعمال كلمات مغربية بحال: دابا، هاد البلان، السواري، الضالة، الحديد، خاصنا).`;
+القواعد:
+- إذا لم تكن الصورة مخطط بناء (وجه أو طبيعة أو صورة عادية)، ضع "isBlueprint": false واشرح ذلك بجملة بالدارجة.
+- إذا كانت بلان بناء أو حديد: استخرج بإيجاز أهم الغرف أو العناصر (حتى 5)، وأهم 4 مواد بناء، و3 مراحل عمل مركزة، وتنبيهين مهمين، مع "darijaSummary" و "audioScript" من 2 إلى 3 جمل واضحة ومفيدة.
+
+أرجع كائن JSON فقط بهذا الشكل:
+{
+  "isBlueprint": true,
+  "title": "عنوان المشروع",
+  "buildingType": "نوع البناء",
+  "totalAreaSqm": "المساحة م²",
+  "roomsCount": 4,
+  "darijaSummary": "ملخص مختصر بالدارجة",
+  "audioScript": "شرح صوتي طبيعي بالدارجة",
+  "structuralNotes": "ملاحظات السواري والحديد",
+  "rooms": [{"name": "الغرفة", "dimensions": "الأبعاد", "areaSqm": "المساحة"}],
+  "materials": [{"name": "المادة", "quantity": "الكمية", "unit": "الوحدة"}],
+  "phases": [{"stepNumber": 1, "phaseName": "المرحلة", "explanationDarija": "الشرح"}],
+  "warnings": ["تنبيه"]
+}`;
 
       const response = await generateWithModelFallback(ai, {
         contents: {
@@ -531,66 +827,17 @@ ${finalNotes ? `ملاحظة صاحب البلان: ${finalNotes}` : ''}
             { text: prompt },
           ],
         },
+        timeoutMs: 16000,
+        budgetMs: 24000,
+        hedgeDelayMs: 3200,
         config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
           responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              isBlueprint: { type: Type.BOOLEAN },
-              title: { type: Type.STRING },
-              buildingType: { type: Type.STRING },
-              totalAreaSqm: { type: Type.STRING },
-              roomsCount: { type: Type.INTEGER },
-              darijaSummary: { type: Type.STRING },
-              audioScript: { type: Type.STRING },
-              structuralNotes: { type: Type.STRING },
-              rooms: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    name: { type: Type.STRING },
-                    dimensions: { type: Type.STRING },
-                    areaSqm: { type: Type.STRING },
-                    notes: { type: Type.STRING },
-                  },
-                },
-              },
-              materials: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    name: { type: Type.STRING },
-                    quantity: { type: Type.STRING },
-                    unit: { type: Type.STRING },
-                    notes: { type: Type.STRING },
-                  },
-                },
-              },
-              phases: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    stepNumber: { type: Type.INTEGER },
-                    phaseName: { type: Type.STRING },
-                    explanationDarija: { type: Type.STRING },
-                  },
-                },
-              },
-              warnings: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-              },
-            },
-          },
         },
       });
 
-      const parsed = parseCleanJson(response.text);
-      return res.json({ success: true, analysis: parsed });
+      const parsedRaw = parseCleanJson<Record<string, unknown>>(response.text);
+      const normalized = normalizeBlueprintAnalysis(parsedRaw);
+      return res.json({ success: true, analysis: normalized });
     } catch (err: unknown) {
       const formatted = formatGeminiError(err, 'وقع خطأ أثناء تحليل البلان.');
       return res.status(formatted.status).json({ success: false, error: formatted.message });
@@ -633,9 +880,13 @@ ${finalNotes ? `ملاحظة صاحب البلان: ${finalNotes}` : ''}
             .join('\n')
         : '';
 
-      const promptText = `أنت "المعلم الذكي" فـ تطبيق فاهم بلان. كتجاوب على أسئلة البناي وصاحب الدار بالدارجة المغربية الواضحة والمختصرة والعملية بالحروف العربية فقط.
+      const compactContext = analysisContext
+        ? JSON.stringify(analysisContext).slice(0, 3500)
+        : '{}';
+
+      const promptText = `أنت "المعلم الذكي" فـ تطبيق فاهم بلان. كتجاوب على أسئلة البناي وصاحب الدار بالدارجة المغربية الواضحة والمختصرة والعملية بالحروف العربية فقط (3 إلى 5 جمل مفيدة ومباشرة).
 معلومات التحليل السابق للبلان:
-${JSON.stringify(analysisContext || {}, null, 2)}
+${compactContext}
 
 المحادثة السابقة:
 ${historyText}
@@ -650,17 +901,17 @@ ${historyText}
       try {
         response = await generateWithModelFallback(ai, {
           contents: { parts },
-          config: {
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          },
+          timeoutMs: 9500,
+          budgetMs: 18500,
+          hedgeDelayMs: parts.length > 1 ? 3000 : 2100,
         });
       } catch (visionChatErr: unknown) {
         if (parts.length > 1 && analysisContext) {
           response = await generateWithModelFallback(ai, {
             contents: { parts: [{ text: promptText }] },
-            config: {
-              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            },
+            timeoutMs: 8000,
+            budgetMs: 14000,
+            hedgeDelayMs: 1800,
           });
         } else {
           throw visionChatErr;
@@ -695,38 +946,35 @@ ${historyText}
         return res.status(400).json({ success: false, error: 'تعذر قراءة الصورة.' });
       }
 
+      const crackPrompt = `أنت مهندس مدني مغربي مختص فتشخيص تشققات المباني (الحيوط، السواري، الضالة، المرطوب).
+عاين هذه الصورة وحدد واش الشق سطحي (surface)، متوسط (moderate)، ولا إنشائي خطير (structural)، وشرح السبب وخطوات الإصلاح بالترتيب بالدارجة المغربية.
+أرجع كائن JSON صحيح فقط بهذا الشكل الدقيق:
+{
+  "severity": "surface أو moderate أو structural",
+  "severityLabelDarija": "توصيف الخطورة بالدارجة",
+  "diagnosisDarija": "التشخيص بالدارجة",
+  "causeDarija": "السبب المحتمل بالدارجة",
+  "repairSteps": ["الخطوة 1", "الخطوة 2"],
+  "audioScript": "نص الشرح الصوتي بالدارجة"
+}`;
+
       const response = await generateWithModelFallback(ai, {
         contents: {
           parts: [
             { inlineData: imagePart },
-            {
-              text: `أنت مهندس مدني مغربي مختص فتشخيص تشققات المباني (الحيوط، السواري، الضالة، المرطوب).
-عاين هذه الصورة وحدد واش الشق سطحي (مرطوب/صباغة)، متوسط، ولا إنشائي خطير كيحتاج تدخل مهندس، وشرح السبب وخطوات الإصلاح بالترتيب بالدارجة المغربية.`,
-            },
+            { text: crackPrompt },
           ],
         },
+        timeoutMs: 15000,
+        budgetMs: 23000,
+        hedgeDelayMs: 3000,
         config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
           responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              severity: { type: Type.STRING, description: 'surface, moderate, or structural' },
-              severityLabelDarija: { type: Type.STRING },
-              diagnosisDarija: { type: Type.STRING },
-              causeDarija: { type: Type.STRING },
-              repairSteps: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-              },
-              audioScript: { type: Type.STRING },
-            },
-          },
         },
       });
 
-      const parsed = parseCleanJson(response.text);
-      return res.json({ success: true, diagnosis: parsed });
+      const parsedRaw = parseCleanJson<Record<string, unknown>>(response.text);
+      return res.json({ success: true, diagnosis: normalizeCrackDiagnosis(parsedRaw) });
     } catch (err: unknown) {
       const formatted = formatGeminiError(err, 'وقع خطأ أثناء فحص الشق.');
       return res.status(formatted.status).json({ success: false, error: formatted.message });
@@ -788,10 +1036,10 @@ ${historyText}
       try {
         const response = await generateWithModelFallback(ai, {
           contents: { parts: audioParts },
-          timeoutMs: 12000,
-          config: {
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          },
+          timeoutMs: 8000,
+          budgetMs: 16500,
+          hedgeDelayMs: 2100,
+          requireText: false,
         });
         rawText = response.text || '';
       } catch (primaryErr: unknown) {
@@ -801,21 +1049,20 @@ ${historyText}
             model: 'gemini-3.5-transcribe',
             contents: { parts: audioParts },
             config: {
-              abortSignal: AbortSignal.timeout(15000),
+              abortSignal: AbortSignal.timeout(12000),
             } as never,
           })
         );
         rawText = betaResp.text || '';
       }
 
-      // If model accidentally leaked Devanagari/foreign script, try dedicated transcribe model once
       if (/[\u0900-\u097F]/.test(rawText) && aiBeta) {
         try {
           const betaResp = await aiBeta.models.generateContent({
             model: 'gemini-3.5-transcribe',
             contents: { parts: audioParts },
             config: {
-              abortSignal: AbortSignal.timeout(12000),
+              abortSignal: AbortSignal.timeout(10000),
             } as never,
           });
           if (betaResp.text && !/[\u0900-\u097F]/.test(betaResp.text)) {
@@ -845,17 +1092,12 @@ ${historyText}
         return res.status(400).json({ success: false, error: 'النص فارغ.' });
       }
       const response = await generateWithModelFallback(ai, {
-        contents: `رتب هاد الملاحظة الصوتية ديال الشانطي بالدارجة المغربية فـ عنوان قصير ولائحة منظمة ديال السلعة أو الخدمة المطلوبة:\n"${rawIdea}"`,
+        contents: `رتب هاد الملاحظة الصوتية ديال الشانطي بالدارجة المغربية فـ عنوان قصير ولائحة منظمة ديال السلعة أو الخدمة المطلوبة:\n"${rawIdea}"\n\nأرجع JSON فقط بهذا الشكل: {"title":"عنوان قصير","structuredDarija":"النص المنظم بالدارجة"}`,
+        timeoutMs: 8500,
+        budgetMs: 17000,
+        hedgeDelayMs: 2100,
         config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
           responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              title: { type: Type.STRING },
-              structuredDarija: { type: Type.STRING },
-            },
-          },
         },
       });
       const parsed = parseCleanJson<{ title?: string; structuredDarija?: string }>(response.text);
@@ -1047,5 +1289,12 @@ ${historyText}
     }
   });
 
+  app.all('/api/*', (_req: Request, res: Response) => {
+    res.status(404).json({ success: false, error: 'المسار غير موجود.' });
+  });
+
   return app;
 }
+
+const app = createApiApp();
+export default app;

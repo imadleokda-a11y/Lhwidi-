@@ -17,6 +17,7 @@ import {
 import type { ToolId, VoiceNote } from '../../types';
 import { SAMPLE_VILLA_IMAGE } from '../../constants';
 import { SpeakButton } from '../../contexts/SpeechContext';
+import { postApiJson } from '../../utils/apiClient';
 
 interface FieldSiteToolsProps {
   toolId: ToolId;
@@ -486,16 +487,25 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
           const reader = new FileReader();
           reader.onloadend = async () => {
             const base64 = typeof reader.result === 'string' ? reader.result : '';
-            const res = await fetch('/api/transcribe', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ audioBase64: base64, mimeType: (blob.type || 'audio/webm').split(';')[0] }),
-            });
-            const data = await res.json();
-            if (res.ok && data.success && data.text) {
-              setRawIdea((prev) => `${prev} ${data.text}`.trim());
-            } else {
-              setIdeaErr(data.error || 'تعذر تحويل الصوت، تقدر تكتب الفكرة مباشرة.');
+            try {
+              const { ok, data } = await postApiJson<{
+                success?: boolean;
+                text?: string;
+                error?: string;
+              }>(
+                '/api/transcribe',
+                { audioBase64: base64, mimeType: (blob.type || 'audio/webm').split(';')[0] },
+                { timeoutMs: 19000, retries: 1 }
+              );
+              if (ok && data.success && data.text) {
+                setRawIdea((prev) => `${prev} ${data.text}`.trim());
+              } else {
+                setIdeaErr(data.error || 'تعذر تحويل الصوت، تقدر تكتب الفكرة مباشرة.');
+              }
+            } catch (err: unknown) {
+              setIdeaErr(
+                err instanceof Error ? err.message : 'تعذر تحويل الصوت، تقدر تكتب الفكرة مباشرة.'
+              );
             }
           };
           reader.readAsDataURL(blob);
@@ -512,13 +522,13 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
       setSavingIdea(true);
       setIdeaErr(null);
       try {
-        const res = await fetch('/api/voice-idea-summary', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ rawIdea }),
-        });
-        const data = await res.json();
-        if (!res.ok || data.success === false) {
+        const { ok, data } = await postApiJson<{
+          success?: boolean;
+          title?: string;
+          structuredDarija?: string;
+          error?: string;
+        }>('/api/voice-idea-summary', { rawIdea }, { timeoutMs: 19000, retries: 1 });
+        if (!ok || data.success === false) {
           throw new Error(data.error || 'تعذر تنظيم الفكرة');
         }
         await onSaveVoiceNote(

@@ -82,6 +82,7 @@ export const HomeView: React.FC<HomeViewProps> = ({
                     className="hidden"
                     onChange={(e) => {
                       const file = e.target.files?.[0];
+                      e.target.value = '';
                       if (!file) return;
                       const reader = new FileReader();
                       reader.onload = () => {

@@ -15,6 +15,7 @@ import {
 import type { CrackDiagnosis, ToolId } from '../../types';
 import { SpeakButton, useDarijaSpeech } from '../../contexts/SpeechContext';
 import { useCodeAccess } from '../../contexts/CodeContext';
+import { postApiJson } from '../../utils/apiClient';
 
 export const SmartSiteTools: React.FC<{ toolId: ToolId }> = ({ toolId }) => {
   const { speakPro, unlockAudio, settings } = useDarijaSpeech();
@@ -632,19 +633,16 @@ export const SmartSiteTools: React.FC<{ toolId: ToolId }> = ({ toolId }) => {
         const compactImg = imgData.startsWith('data:') && imgData.length > 280_000
           ? await compressCrackImage(imgData)
           : imgData;
-        const res = await fetch('/api/detect-cracks', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ imageBase64: compactImg, mimeType: 'image/jpeg' }),
-        });
-        const raw = await res.text();
-        let data: { success?: boolean; diagnosis?: CrackDiagnosis; error?: string } = {};
-        try {
-          data = raw ? JSON.parse(raw) : {};
-        } catch {
-          throw new Error(res.status === 413 ? 'حجم الصورة كبير بزاف، عاود التقطها.' : 'تعذر الاتصال بالخادم، عاود حاول.');
-        }
-        if (!res.ok || !data.success || !data.diagnosis) {
+        const { ok, data } = await postApiJson<{
+          success?: boolean;
+          diagnosis?: CrackDiagnosis;
+          error?: string;
+        }>(
+          '/api/detect-cracks',
+          { imageBase64: compactImg, mimeType: 'image/jpeg' },
+          { timeoutMs: 26000, retries: 1 }
+        );
+        if (!ok || !data.success || !data.diagnosis) {
           throw new Error(data.error || 'تعذر فحص الصورة');
         }
         setCrackResult(data.diagnosis);

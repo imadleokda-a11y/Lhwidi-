@@ -22,6 +22,7 @@ import type { BlueprintAnalysis } from '../types';
 import { QUICK_CHAT_QUESTIONS, SAMPLE_PLANS } from '../constants';
 import { SpeakButton, useDarijaSpeech, VoiceGenderSwitch } from '../contexts/SpeechContext';
 import { useCodeAccess } from '../contexts/CodeContext';
+import { postApiJson } from '../utils/apiClient';
 
 const ANALYSIS_CACHE_KEY = 'fahem_plan_analysis_cache_v1';
 const MAX_CACHED_PLANS = 8;
@@ -119,18 +120,6 @@ async function prepareImageForAnalysis(
   });
 }
 
-async function parseApiJson<T extends Record<string, unknown>>(res: Response): Promise<T> {
-  const raw = await res.text();
-  if (!raw) return {} as T;
-  try {
-    return JSON.parse(raw) as T;
-  } catch {
-    if (res.status === 413) {
-      throw new Error('حجم الصورة كبير بزاف، عاود التقط صورة واضحة أو خفيفة.');
-    }
-    throw new Error(`تعذر الاتصال بالخادم (${res.status || 'خطأ مؤقت'})، عاود حاول.`);
-  }
-}
 
 interface ChatMessage {
   id: string;
@@ -180,6 +169,7 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [micStatus, setMicStatus] = useState<string | null>(null);
   const [micError, setMicError] = useState<string | null>(null);
+  const [failedChatQuestion, setFailedChatQuestion] = useState<string | null>(null);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
@@ -263,17 +253,20 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
       const cacheHit = !!result;
 
       if (!result) {
-        const res = await fetch('/api/analyze-plan', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
+        const { ok, data } = await postApiJson<{
+          success?: boolean;
+          analysis?: BlueprintAnalysis;
+          error?: string;
+        }>(
+          '/api/analyze-plan',
+          {
             imageBase64: payloadImg,
             mimeType: payloadMime,
             notes: trimmedNotes,
-          }),
-        });
-        const data = await parseApiJson<{ success?: boolean; analysis?: BlueprintAnalysis; error?: string }>(res);
-        if (!res.ok || !data.success || !data.analysis) {
+          },
+          { timeoutMs: 27000, retries: 1 }
+        );
+        if (!ok || !data.success || !data.analysis) {
           throw new Error(data.error || 'تعذر تحليل البلان، عاود حاول.');
         }
         result = data.analysis;
@@ -310,6 +303,7 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
     const reader = new FileReader();
     reader.onload = () => {
@@ -321,20 +315,25 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
     reader.readAsDataURL(file);
   };
 
-  const sendChatQuestion = async (overrideText?: string) => {
+  const sendChatQuestion = async (overrideText?: string, skipAppendUser = false) => {
     const question = (overrideText ?? chatInput).trim();
     if (!question || isChatLoading || isAnalyzing) return;
 
     unlockAudio();
-    setChatInput('');
+    if (!skipAppendUser) {
+      setChatInput('');
+    }
     setMicError(null);
+    setFailedChatQuestion(null);
 
-    const userMsg: ChatMessage = {
-      id: `q-${Date.now()}`,
-      role: 'user',
-      text: question,
-    };
-    setMessages((prev) => [...prev, userMsg]);
+    if (!skipAppendUser) {
+      const userMsg: ChatMessage = {
+        id: `q-${Date.now()}`,
+        role: 'user',
+        text: question,
+      };
+      setMessages((prev) => [...prev, userMsg]);
+    }
     setIsChatLoading(true);
 
     try {
@@ -358,21 +357,24 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
         }
       }
 
-      const res = await fetch('/api/chat-plan', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      const historySnapshot = (skipAppendUser ? messages.slice(0, -1) : messages)
+        .slice(-8)
+        .map((m) => ({
+          role: m.role,
+          text: m.text.slice(0, 600),
+        }));
+
+      const { ok, data } = await postApiJson<{ success?: boolean; reply?: string; error?: string }>(
+        '/api/chat-plan',
+        {
           question,
           ...(chatImg ? { imageBase64: chatImg, mimeType: chatMime } : {}),
           analysisContext: analysis,
-          history: messages.slice(-8).map((m) => ({
-            role: m.role,
-            text: m.text.slice(0, 600),
-          })),
-        }),
-      });
-      const data = await parseApiJson<{ success?: boolean; reply?: string; error?: string }>(res);
-      if (!res.ok || !data.success || !data.reply) {
+          history: historySnapshot,
+        },
+        { timeoutMs: 21000, retries: 1 }
+      );
+      if (!ok || !data.success || !data.reply) {
         throw new Error(data.error || 'تعذر الرد دابا.');
       }
       const replyMsg: ChatMessage = {
@@ -385,6 +387,7 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
         void speakPro(data.reply, { id: replyMsg.id, useCloudTts: true });
       }
     } catch (err: unknown) {
+      setFailedChatQuestion(question);
       setMicError(err instanceof Error ? err.message : 'تعذر إرسال السؤال.');
     } finally {
       setIsChatLoading(false);
@@ -511,13 +514,12 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
     try {
       const audioBase64 = await readBlobAsDataUrl(blob);
       const cleanMime = (mime || blob.type || 'audio/webm').split(';')[0];
-      const res = await fetch('/api/transcribe', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ audioBase64, mimeType: cleanMime }),
-      });
-      const data = await parseApiJson<{ success?: boolean; text?: string; error?: string }>(res);
-      if (!res.ok || data.success === false) {
+      const { ok, data } = await postApiJson<{ success?: boolean; text?: string; error?: string }>(
+        '/api/transcribe',
+        { audioBase64, mimeType: cleanMime },
+        { timeoutMs: 19000, retries: 1 }
+      );
+      if (!ok || data.success === false) {
         throw new Error(data.error || 'تعذر تحويل الصوت لكتابة، عاود حاول.');
       }
       const text = typeof data.text === 'string' ? data.text.trim() : '';
@@ -564,10 +566,14 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
     }
     manualStopRef.current = true;
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      cleanupMicAudio();
+      if (silenceIntervalRef.current !== null) {
+        window.clearInterval(silenceIntervalRef.current);
+        silenceIntervalRef.current = null;
+      }
       setIsRecording(false);
       setMicStatus('كيتصيفط الصوت...');
       try {
+        // Stop MediaRecorder BEFORE stopping MediaStream tracks so final audio frames flush cleanly (critical on iOS Safari)
         mediaRecorderRef.current.stop();
       } catch {
         cleanupAllMic(true);
@@ -786,12 +792,10 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
 
     let recorder: MediaRecorder;
     try {
-      const opts: MediaRecorderOptions = { audioBitsPerSecond: 32000 };
-      if (supportedMime) opts.mimeType = supportedMime;
-      recorder = new MediaRecorder(stream, opts);
+      recorder = supportedMime ? new MediaRecorder(stream, { mimeType: supportedMime }) : new MediaRecorder(stream);
     } catch {
       try {
-        recorder = supportedMime ? new MediaRecorder(stream, { mimeType: supportedMime }) : new MediaRecorder(stream);
+        recorder = new MediaRecorder(stream);
       } catch {
         cleanupMicAudio();
         startSpeechRecognitionFallback();
@@ -827,13 +831,20 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
         setMicError('ما سمعت حتى صوت فالميكرو، برك وهضر بصوت واضح.');
         return;
       }
-      const mime = recorder.mimeType || supportedMime || 'audio/webm';
+      const mime = recorder.mimeType || supportedMime || 'audio/mp4';
       const blob = new Blob(chunks, { type: mime });
       void transcribeAudioBlob(blob, mime);
     };
 
+    const actualMime = (recorder.mimeType || supportedMime || '').toLowerCase();
+    const isMp4OrSafari = !actualMime || actualMime.includes('mp4');
     try {
-      recorder.start(100);
+      if (isMp4OrSafari) {
+        // iOS Safari produces valid single-header MP4 audio only when started without a timeslice
+        recorder.start();
+      } else {
+        recorder.start(250);
+      }
     } catch {
       cleanupAllMic(true);
       setMicStatus(null);
@@ -951,8 +962,8 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
       ) {
         releaseTailTimerRef.current = window.setTimeout(() => {
           stopAndSendRecording();
-        }, 120);
-      } else {
+        }, 140);
+      } else if (micStreamRef.current) {
         stopOnStartRef.current = true;
       }
     } else if (isRecording) {
@@ -1250,9 +1261,20 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
           )}
 
           {micError && (
-            <div className="px-4 py-2 border-t border-amber-500/35 bg-amber-950/35 text-xs font-bold text-amber-200 flex items-center gap-2">
-              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
-              <span>{micError}</span>
+            <div className="px-4 py-2 border-t border-amber-500/35 bg-amber-950/35 text-xs font-bold text-amber-200 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                <span>{micError}</span>
+              </div>
+              {failedChatQuestion && !isChatLoading && (
+                <button
+                  type="button"
+                  onClick={() => void sendChatQuestion(failedChatQuestion, true)}
+                  className="shrink-0 rounded-lg bg-[#ff7a1a] hover:bg-[#ff8d3b] text-[#0a0f1e] px-3 py-1 font-extrabold"
+                >
+                  عاود صيفط
+                </button>
+              )}
             </div>
           )}
 

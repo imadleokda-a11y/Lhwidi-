@@ -4,11 +4,15 @@
   "outputDirectory": "dist",
   "framework": "vite",
   "functions": {
-    "api/**/*.ts": {
+    "api/index.ts": {
       "maxDuration": 30
     }
   },
   "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/index.ts"
+    },
     {
       "source": "/((?!api/|assets/|src/assets/|icon\\.svg).*)",
       "destination": "/index.html"
