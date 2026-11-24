@@ -3,7 +3,8 @@ import type { ToolId } from '../../types';
 import { SpeakButton } from '../../contexts/SpeechContext';
 
 const num = (val: string, fallback = 0): number => {
-  const n = parseFloat(val);
+  const normalized = (val || '').trim().replace(',', '.');
+  const n = parseFloat(normalized);
   return Number.isFinite(n) && n >= 0 ? n : fallback;
 };
 

@@ -116,11 +116,12 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
 
         <section className="rounded-3xl border border-white/10 bg-[#11182c] p-5 sm:p-7">
           {isMaterialCalc ? (
-            <MaterialCalculators toolId={activeTool} />
+            <MaterialCalculators key={activeTool} toolId={activeTool} />
           ) : isSmartTool ? (
-            <SmartSiteTools toolId={activeTool} />
+            <SmartSiteTools key={activeTool} toolId={activeTool} />
           ) : (
             <FieldSiteTools
+              key={activeTool}
               toolId={activeTool}
               initialDrawImage={initialDrawImage}
               voiceNotes={voiceNotes}

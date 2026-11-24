@@ -2,17 +2,21 @@ import React, { useEffect, useRef, useState } from 'react';
 import QRCode from 'qrcode';
 import {
   Camera,
+  Check,
   Compass as CompassIcon,
+  Copy,
   Download,
+  Loader2,
   Mic,
   MicOff,
   QrCode,
   RefreshCw,
+  RotateCcw,
   Save,
+  Smartphone,
   Trash2,
   Undo2,
   Upload,
-  Loader2,
 } from 'lucide-react';
 import type { ToolId, VoiceNote } from '../../types';
 import { SAMPLE_VILLA_IMAGE } from '../../constants';
@@ -34,38 +38,46 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
   onSaveVoiceNote,
   onDeleteVoiceNote,
 }) => {
-  // Digital Spirit Level
+  // Digital Spirit Level & Compass
   const [tiltX, setTiltX] = useState(0);
   const [tiltY, setTiltY] = useState(0);
+  const [tiltOffX, setTiltOffX] = useState(0);
+  const [tiltOffY, setTiltOffY] = useState(0);
   const [hasOrient, setHasOrient] = useState(false);
-
-  // Compass
   const [heading, setHeading] = useState(93);
   const [hasCompass, setHasCompass] = useState(false);
+  const [needsOrientPerm, setNeedsOrientPerm] = useState(false);
+  const [orientPermErr, setOrientPermErr] = useState<string | null>(null);
 
   // Camera Measure
   const [measureImg, setMeasureImg] = useState(SAMPLE_VILLA_IMAGE);
   const [measurePts, setMeasurePts] = useState<{ x: number; y: number }[]>([]);
+  const [measureImgDims, setMeasureImgDims] = useState<{ w: number; h: number }>({ w: 1, h: 1 });
   const [refMeters, setRefMeters] = useState('1.0');
   const [camLive, setCamLive] = useState(false);
   const [camErr, setCamErr] = useState<string | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const measureImgRef = useRef<HTMLImageElement | null>(null);
 
   // Voice Ideas
   const [rawIdea, setRawIdea] = useState('');
   const [recording, setRecording] = useState(false);
+  const [transcribingIdea, setTranscribingIdea] = useState(false);
   const [savingIdea, setSavingIdea] = useState(false);
   const [ideaErr, setIdeaErr] = useState<string | null>(null);
   const mediaRecRef = useRef<MediaRecorder | null>(null);
+  const ideaStreamRef = useRef<MediaStream | null>(null);
+  const recognitionRef = useRef<{ stop: () => void } | null>(null);
   const chunksRef = useRef<Blob[]>([]);
 
   // Draw Annotator
   const [drawBg, setDrawBg] = useState(initialDrawImage || SAMPLE_VILLA_IMAGE);
   const [penColor, setPenColor] = useState('#ff7a1a');
   const [penWidth, setPenWidth] = useState(6);
-  const [isDrawing, setIsDrawing] = useState(false);
-  const [undoStack, setUndoStack] = useState<ImageData[]>([]);
+  const [undoCount, setUndoCount] = useState(1);
+  const isDrawingRef = useRef(false);
+  const undoStackRef = useRef<ImageData[]>([]);
   const drawCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // QR Project Card
@@ -74,6 +86,21 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
   const [qrPhone, setQrPhone] = useState('0600000000');
   const [qrNotes, setQrNotes] = useState('رخصة البناء رقم 2026/142 · المعلم حسن');
   const [qrDataUrl, setQrDataUrl] = useState('');
+  const [qrCopied, setQrCopied] = useState(false);
+
+  const attachStreamToVideo = (el: HTMLVideoElement | null, stream: MediaStream | null) => {
+    if (!el || !stream) return;
+    if (el.srcObject !== stream) {
+      el.srcObject = stream;
+    }
+    void el.play().catch(() => undefined);
+  };
+
+  useEffect(() => {
+    if (camLive && streamRef.current && videoRef.current) {
+      attachStreamToVideo(videoRef.current, streamRef.current);
+    }
+  }, [camLive]);
 
   useEffect(() => {
     if (initialDrawImage) setDrawBg(initialDrawImage);
@@ -81,35 +108,102 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
 
   useEffect(() => {
     if (toolId !== 'level' && toolId !== 'compass') return;
+
+    const DOE = window.DeviceOrientationEvent as unknown as {
+      requestPermission?: () => Promise<'granted' | 'denied'>;
+    };
+    if (DOE && typeof DOE.requestPermission === 'function') {
+      setNeedsOrientPerm(true);
+    }
+
+    let gotAbsoluteHeading = false;
+
+    const handleAbsolute = (ev: DeviceOrientationEvent) => {
+      if (typeof ev.alpha === 'number') {
+        gotAbsoluteHeading = true;
+        setHeading(Math.round((360 - ev.alpha) % 360));
+        setHasCompass(true);
+        setNeedsOrientPerm(false);
+      }
+    };
+
     const handler = (ev: DeviceOrientationEvent) => {
       if (typeof ev.gamma === 'number' && typeof ev.beta === 'number') {
         setTiltX(Math.max(-45, Math.min(45, ev.gamma)));
         setTiltY(Math.max(-45, Math.min(45, ev.beta)));
         setHasOrient(true);
+        setNeedsOrientPerm(false);
       }
       const wkHeading = (ev as DeviceOrientationEvent & { webkitCompassHeading?: number })
         .webkitCompassHeading;
-      if (typeof wkHeading === 'number') {
-        setHeading(Math.round(wkHeading));
+      if (typeof wkHeading === 'number' && Number.isFinite(wkHeading)) {
+        setHeading(Math.round(((wkHeading % 360) + 360) % 360));
         setHasCompass(true);
-      } else if (typeof ev.alpha === 'number') {
+        setNeedsOrientPerm(false);
+      } else if (!gotAbsoluteHeading && typeof ev.alpha === 'number') {
         setHeading(Math.round((360 - ev.alpha) % 360));
         setHasCompass(true);
       }
     };
+
+    window.addEventListener('deviceorientationabsolute' as keyof WindowEventMap, handleAbsolute as EventListener);
     window.addEventListener('deviceorientation', handler);
-    return () => window.removeEventListener('deviceorientation', handler);
+    return () => {
+      window.removeEventListener('deviceorientationabsolute' as keyof WindowEventMap, handleAbsolute as EventListener);
+      window.removeEventListener('deviceorientation', handler);
+    };
   }, [toolId]);
+
+  const requestOrientationPermission = async () => {
+    setOrientPermErr(null);
+    const DOE = window.DeviceOrientationEvent as unknown as {
+      requestPermission?: () => Promise<'granted' | 'denied'>;
+    };
+    if (DOE && typeof DOE.requestPermission === 'function') {
+      try {
+        const res = await DOE.requestPermission();
+        if (res === 'granted') {
+          setNeedsOrientPerm(false);
+          setHasOrient(true);
+          setHasCompass(true);
+        } else {
+          setOrientPermErr('ما عطيتيش الإذن لمستشعر الجهاز فالمتصفح.');
+        }
+      } catch {
+        setOrientPermErr('تعذر تفعيل المستشعر، تأكد من إعدادات المتصفح.');
+      }
+    }
+  };
 
   useEffect(() => {
     return () => {
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((t) => t.stop());
+        streamRef.current = null;
+      }
+      if (mediaRecRef.current && mediaRecRef.current.state !== 'inactive') {
+        try {
+          mediaRecRef.current.onstop = null;
+          mediaRecRef.current.stop();
+        } catch {
+          // ignore
+        }
+      }
+      if (ideaStreamRef.current) {
+        ideaStreamRef.current.getTracks().forEach((t) => t.stop());
+        ideaStreamRef.current = null;
+      }
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.stop();
+        } catch {
+          // ignore
+        }
       }
     };
   }, [toolId]);
 
-  // Draw canvas initialization
+  // Draw canvas initialization with natural aspect ratio
   useEffect(() => {
     if (toolId !== 'draw') return;
     const canvas = drawCanvasRef.current;
@@ -120,9 +214,17 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
     const img = new Image();
     img.crossOrigin = 'anonymous';
     img.onload = () => {
+      const natW = img.naturalWidth || 960;
+      const natH = img.naturalHeight || 680;
+      const maxW = 1000;
+      const scale = natW > maxW ? maxW / natW : Math.min(1.5, maxW / Math.max(natW, 1));
+      canvas.width = Math.max(400, Math.round(natW * scale));
+      canvas.height = Math.max(280, Math.round(natH * scale));
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      setUndoStack([ctx.getImageData(0, 0, canvas.width, canvas.height)]);
+      const snap = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      undoStackRef.current = [snap];
+      setUndoCount(1);
     };
     img.src = drawBg;
   }, [toolId, drawBg]);
@@ -141,10 +243,12 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
   }, [toolId, qrProjectName, qrLocation, qrPhone, qrNotes]);
 
   if (toolId === 'level') {
-    const isLevel = Math.abs(tiltX) <= 1 && Math.abs(tiltY) <= 1;
+    const netX = tiltX - tiltOffX;
+    const netY = tiltY - tiltOffY;
+    const isLevel = Math.abs(netX) <= 1 && Math.abs(netY) <= 1;
     const speech = isLevel
       ? 'السطح مقاد نيشان صفر درجة، تقدر تخدم وانت مطمئن.'
-      : `كاين ميلان ديال ${tiltX.toFixed(1)} درجة، قاد التليفون حتى توصل للخضر.`;
+      : `كاين ميلان ديال ${netX.toFixed(1)} درجة، قاد التليفون حتى توصل للخضر.`;
 
     return (
       <div className="space-y-6">
@@ -156,14 +260,58 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
           <SpeakButton id="tool-level-voice" variant="primary" label="سمع بالدارجة" text={speech} />
         </div>
 
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              setTiltOffX(tiltX);
+              setTiltOffY(tiltY);
+            }}
+            className="min-h-[42px] inline-flex items-center gap-1.5 rounded-xl border border-white/15 bg-[#0a0f1e] px-4 text-xs font-bold text-white hover:border-[#ff7a1a]"
+          >
+            <RotateCcw className="w-3.5 h-3.5 text-[#ff7a1a]" />
+            <span>تصفير الميزان (0°)</span>
+          </button>
+
+          {(tiltOffX !== 0 || tiltOffY !== 0) && (
+            <button
+              type="button"
+              onClick={() => {
+                setTiltOffX(0);
+                setTiltOffY(0);
+              }}
+              className="min-h-[42px] rounded-xl border border-white/15 px-3 text-xs text-slate-300 hover:bg-white/10"
+            >
+              إلغاء التصفير
+            </button>
+          )}
+
+          {needsOrientPerm && (
+            <button
+              type="button"
+              onClick={() => void requestOrientationPermission()}
+              className="min-h-[42px] inline-flex items-center gap-1.5 rounded-xl bg-[#ff7a1a] text-[#0a0f1e] px-4 text-xs font-extrabold"
+            >
+              <Smartphone className="w-4 h-4" />
+              <span>تفعيل مستشعر الآيفون</span>
+            </button>
+          )}
+        </div>
+
+        {orientPermErr && (
+          <div className="rounded-xl border border-amber-500/40 bg-amber-950/30 p-3 text-xs text-amber-200">
+            {orientPermErr}
+          </div>
+        )}
+
         <div className="flex flex-col items-center gap-6 py-4">
           <div className="relative w-56 h-56 rounded-full border-4 border-white/15 bg-[#0a0f1e] flex items-center justify-center">
             <div className="w-16 h-16 rounded-full border-2 border-dashed border-[#ff7a1a]/60" />
             <div
               style={{
-                transform: `translate(${Math.max(-75, Math.min(75, tiltX * 2.5))}px, ${Math.max(
+                transform: `translate(${Math.max(-75, Math.min(75, netX * 2.5))}px, ${Math.max(
                   -75,
-                  Math.min(75, tiltY * 2.5)
+                  Math.min(75, netY * 2.5)
                 )}px)`,
               }}
               className={`absolute w-10 h-10 rounded-full transition-transform duration-75 shadow-lg ${
@@ -174,7 +322,7 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
 
           <div className="text-center space-y-1">
             <p className={`text-3xl font-extrabold font-mono-nums ${isLevel ? 'text-emerald-400' : 'text-white'}`}>
-              X: {tiltX.toFixed(1)}° · Y: {tiltY.toFixed(1)}°
+              X: {netX.toFixed(1)}° · Y: {netY.toFixed(1)}°
             </p>
             <p className={`text-sm font-bold ${isLevel ? 'text-emerald-300' : 'text-amber-300'}`}>
               {isLevel ? 'مقاد 100% (Niveau OK)' : 'مازال كاين ميلان'}
@@ -235,6 +383,23 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
           />
         </div>
 
+        {needsOrientPerm && (
+          <button
+            type="button"
+            onClick={() => void requestOrientationPermission()}
+            className="min-h-[42px] inline-flex items-center gap-1.5 rounded-xl bg-[#ff7a1a] text-[#0a0f1e] px-4 text-xs font-extrabold"
+          >
+            <Smartphone className="w-4 h-4" />
+            <span>تفعيل البوصلة فـ الآيفون</span>
+          </button>
+        )}
+
+        {orientPermErr && (
+          <div className="rounded-xl border border-amber-500/40 bg-amber-950/30 p-3 text-xs text-amber-200">
+            {orientPermErr}
+          </div>
+        )}
+
         <div className="flex flex-col items-center gap-6 py-4">
           <div className="relative w-56 h-56 rounded-full border-4 border-white/15 bg-[#0a0f1e] flex items-center justify-center">
             <span className="absolute top-2 text-xs font-bold text-[#ff7a1a]">N</span>
@@ -276,39 +441,52 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
   }
 
   if (toolId === 'camera-measure') {
-    const dist = (a: { x: number; y: number }, b: { x: number; y: number }) =>
-      Math.hypot(b.x - a.x, b.y - a.y);
-    const refPx = measurePts.length >= 2 ? dist(measurePts[0], measurePts[1]) : 0;
-    const targetPx = measurePts.length >= 4 ? dist(measurePts[2], measurePts[3]) : 0;
-    const refM = Math.max(0.05, parseFloat(refMeters) || 1);
+    const syncImgDims = () => {
+      const el = measureImgRef.current;
+      if (el && el.clientWidth > 0 && el.clientHeight > 0) {
+        setMeasureImgDims({ w: el.clientWidth, h: el.clientHeight });
+      }
+    };
+
+    const pxDist = (a: { x: number; y: number }, b: { x: number; y: number }) =>
+      Math.hypot((b.x - a.x) * measureImgDims.w, (b.y - a.y) * measureImgDims.h);
+
+    const refPx = measurePts.length >= 2 ? pxDist(measurePts[0], measurePts[1]) : 0;
+    const targetPx = measurePts.length >= 4 ? pxDist(measurePts[2], measurePts[3]) : 0;
+    const parsedRef = parseFloat((refMeters || '').replace(',', '.'));
+    const refM = Math.max(0.05, Number.isFinite(parsedRef) && parsedRef > 0 ? parsedRef : 1);
     const measured = refPx > 0 && targetPx > 0 ? (targetPx / refPx) * refM : null;
 
     const statusText =
       measurePts.length < 2
-        ? '1. ورك على جوج نقط ديال قياس معروف (مثلا عرض باب = 1 متر)'
+        ? `1. برك على جوج نقط ديال قياس معروف (${measurePts.length}/2)`
         : measurePts.length < 4
-          ? '2. دابا ورك على جوج نقط ديال المسافة اللي باغي تعبرها'
+          ? `2. دابا برك على جوج نقط ديال المسافة اللي باغي تعبرها (${measurePts.length - 2}/2)`
           : `القياس التقريبي هو ${measured?.toFixed(2)} متر`;
 
     const toggleCam = async () => {
       if (camLive) {
-        if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
+        if (streamRef.current) {
+          streamRef.current.getTracks().forEach((t) => t.stop());
+          streamRef.current = null;
+        }
+        if (videoRef.current) videoRef.current.srcObject = null;
         setCamLive(false);
         return;
       }
       setCamErr(null);
       try {
-        const s = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: 'environment' } },
-        });
+        let s: MediaStream;
+        try {
+          s = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: { ideal: 'environment' } },
+          });
+        } catch {
+          s = await navigator.mediaDevices.getUserMedia({ video: true });
+        }
         streamRef.current = s;
         setCamLive(true);
-        setTimeout(() => {
-          if (videoRef.current) {
-            videoRef.current.srcObject = s;
-            void videoRef.current.play().catch(() => void 0);
-          }
-        }, 50);
+        requestAnimationFrame(() => attachStreamToVideo(videoRef.current, s));
       } catch {
         setCamErr('تعذر فتح الكاميرا، تقدر تختار صورة مباشرة.');
       }
@@ -319,7 +497,7 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h2 className="text-xl font-extrabold text-white">القياس بالكاميرا والصورة</h2>
-            <p className="text-sm text-slate-400">علم على مسافة معروفة ومن بعد عبر أي حيط ولا بلان</p>
+            <p className="text-sm text-slate-400">علم على مسافة معروفة ومن بعد عبر أي حيط ولا بلان بدقة</p>
           </div>
           <SpeakButton
             id="tool-measure-voice"
@@ -356,7 +534,10 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
                 if (ctx) {
                   ctx.drawImage(v, 0, 0, c.width, c.height);
                   setMeasureImg(c.toDataURL('image/jpeg', 0.9));
-                  if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
+                  if (streamRef.current) {
+                    streamRef.current.getTracks().forEach((t) => t.stop());
+                    streamRef.current = null;
+                  }
                   setCamLive(false);
                   setMeasurePts([]);
                 }
@@ -367,22 +548,27 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
             </button>
           )}
 
-          <label className="min-h-[44px] cursor-pointer inline-flex items-center gap-2 rounded-xl border border-white/15 bg-[#0a0f1e] text-white px-4 py-2 text-sm font-bold">
+          <label className="min-h-[44px] cursor-pointer inline-flex items-center gap-2 rounded-xl border border-white/15 bg-[#0a0f1e] hover:border-[#ff7a1a] text-white px-4 py-2 text-sm font-bold">
             <Upload className="w-4 h-4 text-[#ff7a1a]" />
             <span>اختار صورة</span>
             <input
               type="file"
               accept="image/*"
-              capture="environment"
               className="hidden"
               onChange={(e) => {
                 const f = e.target.files?.[0];
+                e.target.value = '';
                 if (!f) return;
                 const r = new FileReader();
                 r.onload = () => {
                   if (typeof r.result === 'string') {
                     setMeasureImg(r.result);
                     setMeasurePts([]);
+                    if (streamRef.current) {
+                      streamRef.current.getTracks().forEach((t) => t.stop());
+                      streamRef.current = null;
+                    }
+                    setCamLive(false);
                   }
                 };
                 r.readAsDataURL(f);
@@ -393,23 +579,34 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
           <label className="flex items-center gap-2 text-xs text-slate-300">
             <span>الطول المرجعي (متر):</span>
             <input
-              type="number"
-              step="0.1"
-              min="0.1"
+              type="text"
+              inputMode="decimal"
               value={refMeters}
               onChange={(e) => setRefMeters(e.target.value)}
               className="w-20 min-h-[40px] rounded-lg border border-white/15 bg-[#0a0f1e] px-2.5 text-white font-mono-nums"
             />
           </label>
 
-          <button
-            type="button"
-            onClick={() => setMeasurePts([])}
-            className="min-h-[44px] inline-flex items-center gap-1.5 rounded-xl border border-white/15 px-3.5 py-2 text-xs font-semibold text-slate-200 hover:bg-white/10"
-          >
-            <RefreshCw className="w-4 h-4" />
-            <span>مسح النقط</span>
-          </button>
+          {measurePts.length > 0 && (
+            <>
+              <button
+                type="button"
+                onClick={() => setMeasurePts((prev) => prev.slice(0, -1))}
+                className="min-h-[44px] inline-flex items-center gap-1.5 rounded-xl border border-white/15 px-3 text-xs font-semibold text-slate-200 hover:bg-white/10"
+              >
+                <Undo2 className="w-4 h-4" />
+                <span>تراجع</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setMeasurePts([])}
+                className="min-h-[44px] inline-flex items-center gap-1.5 rounded-xl border border-white/15 px-3.5 py-2 text-xs font-semibold text-slate-200 hover:bg-white/10"
+              >
+                <RefreshCw className="w-4 h-4" />
+                <span>مسح النقط</span>
+              </button>
+            </>
+          )}
         </div>
 
         {camErr && (
@@ -418,47 +615,86 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
           </div>
         )}
 
-        <div className="rounded-xl border border-[#ff7a1a]/30 bg-[#0a0f1e] px-4 py-3 flex items-center justify-between">
+        <div className="rounded-xl border border-[#ff7a1a]/30 bg-[#0a0f1e] px-4 py-3 flex flex-wrap items-center justify-between gap-2">
           <span className="text-sm font-bold text-[#ff7a1a]">{statusText}</span>
           {measured !== null && (
             <span className="text-xl font-extrabold font-mono-nums text-white">
-              {measured.toFixed(2)} م
+              {measured.toFixed(2)} م ({Math.round(measured * 100)} سم)
             </span>
           )}
         </div>
 
-        <div
-          onClick={(e) => {
-            if (camLive) return;
-            const rect = e.currentTarget.getBoundingClientRect();
-            const x = ((e.clientX - rect.left) / rect.width) * 100;
-            const y = ((e.clientY - rect.top) / rect.height) * 100;
-            setMeasurePts((prev) => (prev.length >= 4 ? [{ x, y }] : [...prev, { x, y }]));
-          }}
-          className="relative w-full rounded-2xl overflow-hidden border border-white/15 bg-black cursor-crosshair select-none"
-        >
+        <div className="relative w-full rounded-2xl overflow-hidden border border-white/15 bg-black flex items-center justify-center p-2">
           {camLive ? (
-            <video ref={videoRef} autoPlay playsInline muted className="w-full h-80 sm:h-96 object-cover" />
+            <video
+              ref={(el) => {
+                videoRef.current = el;
+                attachStreamToVideo(el, streamRef.current);
+              }}
+              autoPlay
+              playsInline
+              muted
+              className="w-full h-80 sm:h-96 object-cover rounded-xl"
+            />
           ) : (
-            <>
+            <div
+              onPointerDown={(e) => {
+                e.preventDefault();
+                syncImgDims();
+                const rect = e.currentTarget.getBoundingClientRect();
+                if (!rect.width || !rect.height) return;
+                const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                const y = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+                setMeasurePts((prev) => (prev.length >= 4 ? [{ x, y }] : [...prev, { x, y }]));
+              }}
+              className="relative inline-block cursor-crosshair select-none touch-none"
+            >
               <img
+                ref={measureImgRef}
                 src={measureImg}
                 alt="صورة للقياس"
+                onLoad={syncImgDims}
                 referrerPolicy="no-referrer"
-                className="w-full max-h-[420px] object-contain mx-auto pointer-events-none"
+                className="block max-w-full max-h-[420px] w-auto h-auto pointer-events-none select-none rounded-lg"
               />
-              <svg className="absolute inset-0 w-full h-full pointer-events-none" viewBox="0 0 100 100" preserveAspectRatio="none">
+              <svg
+                className="absolute inset-0 w-full h-full pointer-events-none"
+                viewBox="0 0 100 100"
+                preserveAspectRatio="none"
+              >
                 {measurePts.length >= 2 && (
-                  <line x1={measurePts[0].x} y1={measurePts[0].y} x2={measurePts[1].x} y2={measurePts[1].y} stroke="#38bdf8" strokeWidth="0.7" />
+                  <line
+                    x1={measurePts[0].x * 100}
+                    y1={measurePts[0].y * 100}
+                    x2={measurePts[1].x * 100}
+                    y2={measurePts[1].y * 100}
+                    stroke="#38bdf8"
+                    strokeWidth="0.9"
+                  />
                 )}
                 {measurePts.length >= 4 && (
-                  <line x1={measurePts[2].x} y1={measurePts[2].y} x2={measurePts[3].x} y2={measurePts[3].y} stroke="#ff7a1a" strokeWidth="0.8" />
+                  <line
+                    x1={measurePts[2].x * 100}
+                    y1={measurePts[2].y * 100}
+                    x2={measurePts[3].x * 100}
+                    y2={measurePts[3].y * 100}
+                    stroke="#ff7a1a"
+                    strokeWidth="1"
+                  />
                 )}
                 {measurePts.map((pt, idx) => (
-                  <circle key={idx} cx={pt.x} cy={pt.y} r="1.4" fill={idx < 2 ? '#38bdf8' : '#ff7a1a'} stroke="#0a0f1e" strokeWidth="0.4" />
+                  <circle
+                    key={idx}
+                    cx={pt.x * 100}
+                    cy={pt.y * 100}
+                    r="1.8"
+                    fill={idx < 2 ? '#38bdf8' : '#ff7a1a'}
+                    stroke="#0a0f1e"
+                    strokeWidth="0.5"
+                  />
                 ))}
               </svg>
-            </>
+            </div>
           )}
         </div>
       </div>
@@ -466,24 +702,136 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
   }
 
   if (toolId === 'voice-ideas') {
-    const toggleRec = async () => {
-      if (recording && mediaRecRef.current) {
-        mediaRecRef.current.stop();
-        setRecording(false);
+    const startSpeechRecFallback = () => {
+      const win = window as unknown as {
+        SpeechRecognition?: new () => {
+          lang: string;
+          continuous: boolean;
+          interimResults: boolean;
+          onresult: ((ev: { results: ArrayLike<{ 0?: { transcript?: string } }> }) => void) | null;
+          onerror: (() => void) | null;
+          onend: (() => void) | null;
+          start: () => void;
+          stop: () => void;
+        };
+        webkitSpeechRecognition?: new () => {
+          lang: string;
+          continuous: boolean;
+          interimResults: boolean;
+          onresult: ((ev: { results: ArrayLike<{ 0?: { transcript?: string } }> }) => void) | null;
+          onerror: (() => void) | null;
+          onend: (() => void) | null;
+          start: () => void;
+          stop: () => void;
+        };
+      };
+      const SR = win.SpeechRecognition || win.webkitSpeechRecognition;
+      if (!SR) {
+        setIdeaErr('المتصفح ما كيدعمش الميكروفون التلقائي، كتب الملاحظة مباشرة.');
         return;
       }
+      const rec = new SR();
+      rec.lang = 'ar-MA';
+      rec.continuous = true;
+      rec.interimResults = false;
+      rec.onresult = (ev) => {
+        let joined = '';
+        for (let i = 0; i < ev.results.length; i++) {
+          const piece = ev.results[i]?.[0]?.transcript;
+          if (piece) joined += `${piece} `;
+        }
+        const cleaned = joined.trim();
+        if (cleaned) setRawIdea((prev) => `${prev} ${cleaned}`.trim());
+      };
+      rec.onerror = () => {
+        setRecording(false);
+        setIdeaErr('تعذر استخدام الميكروفون، تأكد من الإذن ولا كتب الفكرة مباشرة.');
+      };
+      rec.onend = () => {
+        setRecording(false);
+        recognitionRef.current = null;
+      };
+      recognitionRef.current = rec;
+      rec.start();
+      setRecording(true);
+    };
+
+    const toggleRec = async () => {
+      if (recording) {
+        setRecording(false);
+        if (mediaRecRef.current && mediaRecRef.current.state !== 'inactive') {
+          try {
+            // Stop MediaRecorder BEFORE stopping MediaStream tracks for clean iOS Safari final chunk
+            mediaRecRef.current.stop();
+          } catch {
+            if (ideaStreamRef.current) {
+              ideaStreamRef.current.getTracks().forEach((t) => t.stop());
+              ideaStreamRef.current = null;
+            }
+          }
+          return;
+        }
+        if (recognitionRef.current) {
+          try {
+            recognitionRef.current.stop();
+          } catch {
+            // ignore
+          }
+          recognitionRef.current = null;
+        }
+        return;
+      }
+
+      if (transcribingIdea) return;
       setIdeaErr(null);
+
+      if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+        startSpeechRecFallback();
+        return;
+      }
+
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        const rec = new MediaRecorder(stream);
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
+        ideaStreamRef.current = stream;
+        const supportedMime =
+          (typeof MediaRecorder.isTypeSupported === 'function' &&
+            ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus'].find((m) =>
+              MediaRecorder.isTypeSupported(m)
+            )) ||
+          '';
+
+        const rec = supportedMime ? new MediaRecorder(stream, { mimeType: supportedMime }) : new MediaRecorder(stream);
         chunksRef.current = [];
         mediaRecRef.current = rec;
         rec.ondataavailable = (ev) => {
-          if (ev.data.size > 0) chunksRef.current.push(ev.data);
+          if (ev.data && ev.data.size > 0) chunksRef.current.push(ev.data);
+        };
+        rec.onerror = () => {
+          setRecording(false);
+          if (ideaStreamRef.current) {
+            ideaStreamRef.current.getTracks().forEach((t) => t.stop());
+            ideaStreamRef.current = null;
+          }
+          setIdeaErr('وقع مشكل فـ تسجيل الصوت، عاود جرب.');
         };
         rec.onstop = () => {
-          stream.getTracks().forEach((t) => t.stop());
-          const blob = new Blob(chunksRef.current, { type: rec.mimeType || 'audio/webm' });
+          if (ideaStreamRef.current) {
+            ideaStreamRef.current.getTracks().forEach((t) => t.stop());
+            ideaStreamRef.current = null;
+          }
+          mediaRecRef.current = null;
+          const mime = rec.mimeType || supportedMime || 'audio/mp4';
+          const blob = new Blob(chunksRef.current, { type: mime });
+          chunksRef.current = [];
+
+          if (blob.size < 150) {
+            setIdeaErr('التسجيل قصير بزاف، برك وهضر بالدارجة عاد حبس.');
+            return;
+          }
+
+          setTranscribingIdea(true);
           const reader = new FileReader();
           reader.onloadend = async () => {
             const base64 = typeof reader.result === 'string' ? reader.result : '';
@@ -506,11 +854,19 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
               setIdeaErr(
                 err instanceof Error ? err.message : 'تعذر تحويل الصوت، تقدر تكتب الفكرة مباشرة.'
               );
+            } finally {
+              setTranscribingIdea(false);
             }
           };
           reader.readAsDataURL(blob);
         };
-        rec.start();
+
+        const actualMime = (rec.mimeType || supportedMime || '').toLowerCase();
+        if (!actualMime || actualMime.includes('mp4')) {
+          rec.start();
+        } else {
+          rec.start(250);
+        }
         setRecording(true);
       } catch {
         setIdeaErr('تأكد من السماح للميكروفون ولا اكتب الفكرة مباشرة.');
@@ -562,16 +918,40 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
         </div>
 
         <div className="space-y-3">
-          <button
-            type="button"
-            onClick={() => void toggleRec()}
-            className={`min-h-[48px] inline-flex items-center gap-2 rounded-xl px-5 py-2.5 text-sm font-extrabold transition-colors ${
-              recording ? 'bg-red-500 text-white' : 'bg-[#ff7a1a] text-[#0a0f1e] hover:bg-[#ff8d3b]'
-            }`}
-          >
-            {recording ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
-            <span>{recording ? 'حبس التسجيل' : 'هضر وسجل بالصوت'}</span>
-          </button>
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              disabled={transcribingIdea}
+              onClick={() => void toggleRec()}
+              className={`min-h-[48px] inline-flex items-center gap-2 rounded-xl px-5 py-2.5 text-sm font-extrabold transition-colors disabled:opacity-50 ${
+                recording
+                  ? 'bg-emerald-500 text-[#0a0f1e]'
+                  : 'bg-[#ff7a1a] text-[#0a0f1e] hover:bg-[#ff8d3b]'
+              }`}
+            >
+              {transcribingIdea ? (
+                <Loader2 className="w-5 h-5 animate-spin" />
+              ) : recording ? (
+                <MicOff className="w-5 h-5" />
+              ) : (
+                <Mic className="w-5 h-5" />
+              )}
+              <span>
+                {transcribingIdea
+                  ? 'كنكتب كلامك بالدارجة...'
+                  : recording
+                    ? 'سالي وهضر (برك للإرسال)'
+                    : 'هضر وسجل بالصوت'}
+              </span>
+            </button>
+
+            {recording && (
+              <span className="inline-flex items-center gap-2 text-xs font-bold text-emerald-300">
+                <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />
+                <span>الميكرو شغال... هضر بالدارجة</span>
+              </span>
+            )}
+          </div>
 
           <textarea
             rows={4}
@@ -585,7 +965,7 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
 
           <button
             type="button"
-            disabled={!rawIdea.trim() || savingIdea}
+            disabled={!rawIdea.trim() || savingIdea || transcribingIdea}
             onClick={() => void handleSaveIdea()}
             className="min-h-[48px] w-full sm:w-auto inline-flex items-center justify-center gap-2 rounded-xl bg-white text-[#0a0f1e] hover:bg-slate-200 px-6 py-3 text-sm font-extrabold disabled:opacity-50"
           >
@@ -633,9 +1013,15 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
 
   if (toolId === 'draw') {
     const startDraw = (e: React.PointerEvent<HTMLCanvasElement>) => {
+      e.preventDefault();
       const c = drawCanvasRef.current;
       const ctx = c?.getContext('2d');
       if (!c || !ctx) return;
+      try {
+        c.setPointerCapture?.(e.pointerId);
+      } catch {
+        // ignore
+      }
       const rect = c.getBoundingClientRect();
       const x = ((e.clientX - rect.left) / rect.width) * c.width;
       const y = ((e.clientY - rect.top) / rect.height) * c.height;
@@ -645,11 +1031,14 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
       ctx.lineWidth = penWidth;
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
-      setIsDrawing(true);
+      ctx.lineTo(x + 0.01, y + 0.01);
+      ctx.stroke();
+      isDrawingRef.current = true;
     };
 
     const moveDraw = (e: React.PointerEvent<HTMLCanvasElement>) => {
-      if (!isDrawing) return;
+      if (!isDrawingRef.current) return;
+      e.preventDefault();
       const c = drawCanvasRef.current;
       const ctx = c?.getContext('2d');
       if (!c || !ctx) return;
@@ -661,31 +1050,41 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
     };
 
     const endDraw = () => {
-      if (!isDrawing) return;
-      setIsDrawing(false);
+      if (!isDrawingRef.current) return;
+      isDrawingRef.current = false;
       const c = drawCanvasRef.current;
       const ctx = c?.getContext('2d');
       if (c && ctx) {
-        setUndoStack((prev) => [...prev.slice(-15), ctx.getImageData(0, 0, c.width, c.height)]);
+        const next = [...undoStackRef.current.slice(-15), ctx.getImageData(0, 0, c.width, c.height)];
+        undoStackRef.current = next;
+        setUndoCount(next.length);
       }
     };
 
     const handleUndo = () => {
       const c = drawCanvasRef.current;
       const ctx = c?.getContext('2d');
-      if (!c || !ctx || undoStack.length <= 1) return;
-      const next = undoStack.slice(0, -1);
+      if (!c || !ctx || undoStackRef.current.length <= 1) return;
+      const next = undoStackRef.current.slice(0, -1);
       ctx.putImageData(next[next.length - 1], 0, 0);
-      setUndoStack(next);
+      undoStackRef.current = next;
+      setUndoCount(next.length);
     };
 
     const handleDownload = () => {
       const c = drawCanvasRef.current;
       if (!c) return;
-      const a = document.createElement('a');
-      a.href = c.toDataURL('image/png');
-      a.download = `fahem-blan-markup-${Date.now()}.png`;
-      a.click();
+      c.toBlob((blob) => {
+        if (!blob) return;
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `fahem-blan-markup-${Date.now()}.png`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 4000);
+      }, 'image/png');
     };
 
     return (
@@ -706,7 +1105,7 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
         </div>
 
         <div className="flex flex-wrap items-center gap-3">
-          <label className="min-h-[44px] cursor-pointer inline-flex items-center gap-2 rounded-xl bg-[#16203a] border border-white/15 px-4 py-2 text-xs font-bold text-white">
+          <label className="min-h-[44px] cursor-pointer inline-flex items-center gap-2 rounded-xl bg-[#16203a] border border-white/15 px-4 py-2 text-xs font-bold text-white hover:border-[#ff7a1a]">
             <Upload className="w-4 h-4 text-[#ff7a1a]" />
             <span>بدل الصورة</span>
             <input
@@ -715,6 +1114,7 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
               className="hidden"
               onChange={(e) => {
                 const f = e.target.files?.[0];
+                e.target.value = '';
                 if (!f) return;
                 const r = new FileReader();
                 r.onload = () => {
@@ -753,7 +1153,7 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
           <button
             type="button"
             onClick={handleUndo}
-            disabled={undoStack.length <= 1}
+            disabled={undoCount <= 1}
             className="min-h-[44px] inline-flex items-center gap-1.5 rounded-xl border border-white/15 px-3.5 py-2 text-xs font-semibold text-slate-200 disabled:opacity-40"
           >
             <Undo2 className="w-4 h-4" />
@@ -770,7 +1170,7 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
           </button>
         </div>
 
-        <div className="rounded-2xl overflow-hidden border border-white/15 bg-black">
+        <div className="rounded-2xl overflow-hidden border border-white/15 bg-black flex justify-center">
           <canvas
             ref={drawCanvasRef}
             width={960}
@@ -778,8 +1178,8 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
             onPointerDown={startDraw}
             onPointerMove={moveDraw}
             onPointerUp={endDraw}
-            onPointerLeave={endDraw}
-            className="w-full h-auto touch-none cursor-crosshair"
+            onPointerCancel={endDraw}
+            className="w-full h-auto touch-none cursor-crosshair block"
           />
         </div>
       </div>
@@ -787,6 +1187,17 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
   }
 
   // QR project card
+  const copyQrDetails = async () => {
+    const summary = `${qrProjectName}\n${qrLocation}\n${qrPhone}\n${qrNotes}`;
+    try {
+      await navigator.clipboard.writeText(summary);
+      setQrCopied(true);
+      setTimeout(() => setQrCopied(false), 2000);
+    } catch {
+      // ignore
+    }
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -862,14 +1273,24 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
             <p className="text-xs text-slate-400">{qrLocation}</p>
           </div>
           {qrDataUrl && (
-            <a
-              href={qrDataUrl}
-              download={`fahem-blan-qr-${Date.now()}.png`}
-              className="w-full min-h-[44px] inline-flex items-center justify-center gap-2 rounded-xl bg-[#ff7a1a] text-[#0a0f1e] text-xs font-extrabold"
-            >
-              <Download className="w-4 h-4" />
-              <span>تحميل كود QR</span>
-            </a>
+            <div className="space-y-2">
+              <a
+                href={qrDataUrl}
+                download={`fahem-blan-qr-${Date.now()}.png`}
+                className="w-full min-h-[44px] inline-flex items-center justify-center gap-2 rounded-xl bg-[#ff7a1a] text-[#0a0f1e] text-xs font-extrabold"
+              >
+                <Download className="w-4 h-4" />
+                <span>تحميل كود QR</span>
+              </a>
+              <button
+                type="button"
+                onClick={() => void copyQrDetails()}
+                className="w-full min-h-[40px] inline-flex items-center justify-center gap-2 rounded-xl border border-white/15 bg-white/5 text-xs font-bold text-slate-200 hover:bg-white/10"
+              >
+                {qrCopied ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
+                <span>{qrCopied ? 'تم نسخ المعلومات' : 'نسخ معلومات المشروع'}</span>
+              </button>
+            </div>
           )}
         </div>
       </div>
