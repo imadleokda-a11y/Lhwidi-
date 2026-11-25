@@ -12,14 +12,16 @@ import {
   Hammer,
   Loader2,
   Mic,
+  Paperclip,
   Pencil,
   Send,
   Sparkles,
   Upload,
   User,
+  X,
 } from 'lucide-react';
 import type { BlueprintAnalysis } from '../types';
-import { QUICK_CHAT_QUESTIONS, SAMPLE_PLANS } from '../constants';
+import { SAMPLE_PLANS } from '../constants';
 import { SpeakButton, useDarijaSpeech, VoiceGenderSwitch } from '../contexts/SpeechContext';
 import { useCodeAccess } from '../contexts/CodeContext';
 import { postApiJson } from '../utils/apiClient';
@@ -160,6 +162,8 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
   const [showDetails, setShowDetails] = useState(true);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
+  const [pendingChatImage, setPendingChatImage] = useState<string | null>(null);
+  const [showAttachMenu, setShowAttachMenu] = useState(false);
   const [isChatLoading, setIsChatLoading] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [savedSuccess, setSavedSuccess] = useState(false);
@@ -192,6 +196,9 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const lastAutoAnalyzedRef = useRef<string | null>(null);
   const sendChatRef = useRef<(overrideText?: string) => Promise<void>>(async () => {});
+  const attachMenuRef = useRef<HTMLDivElement | null>(null);
+  const hasCustomChatImageRef = useRef(false);
+  const failedChatImageRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (initialImageSrc) {
@@ -207,7 +214,22 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, isAnalyzing, isChatLoading]);
+  }, [messages, isAnalyzing, isChatLoading, pendingChatImage]);
+
+  useEffect(() => {
+    if (!showAttachMenu) return;
+    const handleOutside = (ev: MouseEvent | TouchEvent) => {
+      if (attachMenuRef.current && !attachMenuRef.current.contains(ev.target as Node)) {
+        setShowAttachMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutside);
+    document.addEventListener('touchstart', handleOutside);
+    return () => {
+      document.removeEventListener('mousedown', handleOutside);
+      document.removeEventListener('touchstart', handleOutside);
+    };
+  }, [showAttachMenu]);
 
   const runAnalysis = async (src: string, notes: string, forceNew = true) => {
     if (!src) return;
@@ -223,6 +245,10 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
     setIsAnalyzing(true);
     setSavedSuccess(false);
     setAnalysis(null);
+    setPendingChatImage(null);
+    setShowAttachMenu(false);
+    hasCustomChatImageRef.current = false;
+    failedChatImageRef.current = null;
 
     setMessages([
       {
@@ -315,22 +341,43 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
     reader.readAsDataURL(file);
   };
 
+  const handleChatAttachFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    setShowAttachMenu(false);
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === 'string') {
+        setPendingChatImage(reader.result);
+        setMicError(null);
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
   const sendChatQuestion = async (overrideText?: string, skipAppendUser = false) => {
-    const question = (overrideText ?? chatInput).trim();
+    const attachedImage = skipAppendUser ? failedChatImageRef.current : pendingChatImage;
+    const rawTyped = (overrideText ?? chatInput).trim();
+    const question = rawTyped || (attachedImage ? 'شوف هاد صورة البلان وشرحو ليا بالدارجة.' : '');
     if (!question || isChatLoading || isAnalyzing) return;
 
     unlockAudio();
     if (!skipAppendUser) {
       setChatInput('');
+      setPendingChatImage(null);
+      setShowAttachMenu(false);
     }
     setMicError(null);
     setFailedChatQuestion(null);
+    failedChatImageRef.current = null;
 
     if (!skipAppendUser) {
       const userMsg: ChatMessage = {
         id: `q-${Date.now()}`,
         role: 'user',
-        text: question,
+        text: rawTyped || 'ها هي صورة البلان، شوفها وشرحها بالدارجة.',
+        ...(attachedImage ? { imageUrl: attachedImage } : {}),
       };
       setMessages((prev) => [...prev, userMsg]);
     }
@@ -339,7 +386,21 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
     try {
       let chatImg: string | undefined;
       let chatMime = compressedMime || 'image/jpeg';
-      if (!analysis && imageSrc) {
+
+      if (attachedImage) {
+        hasCustomChatImageRef.current = true;
+        setImageSrc(attachedImage);
+        try {
+          const prepared = await prepareImageForAnalysis(attachedImage);
+          setCompressedSrc(prepared.analysisDataUrl);
+          setCompressedMime(prepared.mimeType);
+          setThumbnailSrc(prepared.thumbnailDataUrl);
+          chatImg = prepared.analysisDataUrl;
+          chatMime = prepared.mimeType;
+        } catch {
+          chatImg = attachedImage;
+        }
+      } else if ((!analysis || hasCustomChatImageRef.current) && imageSrc) {
         if (compressedSrc) {
           chatImg = compressedSrc;
         } else if (imageSrc.startsWith('data:') && imageSrc.length > 350_000) {
@@ -369,7 +430,7 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
         {
           question,
           ...(chatImg ? { imageBase64: chatImg, mimeType: chatMime } : {}),
-          analysisContext: analysis,
+          analysisContext: attachedImage || hasCustomChatImageRef.current ? undefined : analysis,
           history: historySnapshot,
         },
         { timeoutMs: 21000, retries: 1 }
@@ -387,6 +448,7 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
         void speakPro(data.reply, { id: replyMsg.id, useCloudTts: true });
       }
     } catch (err: unknown) {
+      failedChatImageRef.current = attachedImage || null;
       setFailedChatQuestion(question);
       setMicError(err instanceof Error ? err.message : 'تعذر إرسال السؤال.');
     } finally {
@@ -1233,22 +1295,6 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
             <div ref={chatEndRef} />
           </div>
 
-          {analysis && analysis.isBlueprint !== false && (
-            <div className="px-4 py-2.5 border-t border-white/10 bg-[#0d1426] flex flex-wrap gap-2">
-              {QUICK_CHAT_QUESTIONS.map((q) => (
-                <button
-                  key={q}
-                  type="button"
-                  disabled={isChatLoading || isAnalyzing}
-                  onClick={() => void sendChatQuestion(q)}
-                  className="min-h-[34px] rounded-xl border border-[#ff7a1a]/30 bg-[#ff7a1a]/10 hover:bg-[#ff7a1a] hover:text-[#0a0f1e] text-[#ff7a1a] px-3 py-1 text-xs font-bold transition-colors disabled:opacity-50"
-                >
-                  {q}
-                </button>
-              ))}
-            </div>
-          )}
-
           {micStatus && (
             <div className="px-4 py-2 border-t border-emerald-500/30 bg-emerald-950/25 text-xs font-bold text-emerald-200 flex items-center gap-2">
               {isTranscribing ? (
@@ -1275,6 +1321,30 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
                   عاود صيفط
                 </button>
               )}
+            </div>
+          )}
+
+          {pendingChatImage && (
+            <div className="px-3 sm:px-4 py-2.5 border-t border-white/10 bg-[#0d1426] flex items-center justify-between gap-3">
+              <div className="flex items-center gap-3 min-w-0">
+                <img
+                  src={pendingChatImage}
+                  alt="معاينة صورة البلان قبل الإرسال"
+                  className="w-16 h-16 rounded-xl object-cover border border-white/15 bg-black shrink-0"
+                />
+                <div className="min-w-0">
+                  <p className="text-xs font-bold text-white truncate">معاينة صورة البلان</p>
+                  <p className="text-[11px] text-slate-400">زيد سؤال أو ضغط زر الإرسال الأخضر</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPendingChatImage(null)}
+                aria-label="حذف الصورة المختارة"
+                className="w-8 h-8 rounded-lg border border-white/15 bg-white/5 hover:bg-white/10 text-slate-300 flex items-center justify-center shrink-0"
+              >
+                <X className="w-4 h-4" />
+              </button>
             </div>
           )}
 
@@ -1321,16 +1391,54 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
                 if (micError) setMicError(null);
               }}
               placeholder="برك على الميكرو وهضر بحال واتساب، ولا كتب سؤالك..."
-              className="flex-1 min-h-[46px] rounded-xl border border-white/15 bg-[#0a0f1e] px-4 text-sm text-white placeholder:text-slate-500 focus:border-[#ff7a1a] focus:outline-none"
+              className="flex-1 min-w-0 min-h-[46px] rounded-xl border border-white/15 bg-[#0a0f1e] px-4 text-sm text-white placeholder:text-slate-500 focus:border-[#ff7a1a] focus:outline-none"
             />
-            <button
-              type="submit"
-              disabled={!chatInput.trim() || isChatLoading || isAnalyzing}
-              className="min-h-[46px] px-4 sm:px-5 rounded-xl bg-[#ff7a1a] hover:bg-[#ff8d3b] text-[#0a0f1e] font-extrabold text-sm inline-flex items-center gap-1.5 disabled:opacity-50"
-            >
-              <Send className="w-4 h-4" />
-              <span className="hidden sm:inline">صيفط</span>
-            </button>
+            <div ref={attachMenuRef} className="relative flex items-center gap-1 shrink-0">
+              {showAttachMenu && (
+                <div className="absolute bottom-full left-0 mb-2 w-44 rounded-xl border border-white/15 bg-[#0d1426] p-1.5 shadow-2xl z-30 space-y-1">
+                  <label className="w-full min-h-[40px] px-3 rounded-lg hover:bg-white/10 text-xs font-bold text-white flex items-center gap-2.5 cursor-pointer">
+                    <Camera className="w-4 h-4 text-[#ff7a1a] shrink-0" />
+                    <span>الكاميرا</span>
+                    <input
+                      type="file"
+                      accept="image/*"
+                      capture="environment"
+                      className="hidden"
+                      onChange={handleChatAttachFileChange}
+                    />
+                  </label>
+                  <label className="w-full min-h-[40px] px-3 rounded-lg hover:bg-white/10 text-xs font-bold text-white flex items-center gap-2.5 cursor-pointer">
+                    <Upload className="w-4 h-4 text-[#ff7a1a] shrink-0" />
+                    <span>المعرض (الصور)</span>
+                    <input
+                      type="file"
+                      accept="image/*"
+                      className="hidden"
+                      onChange={handleChatAttachFileChange}
+                    />
+                  </label>
+                </div>
+              )}
+              <button
+                type="button"
+                onClick={() => setShowAttachMenu((v) => !v)}
+                disabled={isChatLoading || isAnalyzing || isRecording || isTranscribing}
+                aria-label="إرفاق صورة البلان"
+                title="إرفاق صورة البلان من المعرض أو الكاميرا"
+                className="w-[46px] h-[46px] rounded-xl border border-white/15 bg-[#0a0f1e] hover:border-[#ff7a1a] text-slate-200 flex items-center justify-center shrink-0 transition-colors disabled:opacity-50"
+              >
+                <Paperclip className="w-5 h-5" />
+              </button>
+              <button
+                type="submit"
+                disabled={(!chatInput.trim() && !pendingChatImage) || isChatLoading || isAnalyzing}
+                aria-label="إرسال"
+                title="إرسال"
+                className="w-[46px] h-[46px] rounded-xl bg-emerald-500 hover:bg-emerald-400 text-[#0a0f1e] font-extrabold flex items-center justify-center shrink-0 transition-colors disabled:opacity-50"
+              >
+                <Send className="w-5 h-5" />
+              </button>
+            </div>
           </form>
         </section>
       )}
