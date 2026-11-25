@@ -19,6 +19,7 @@ import {
   saveStoredCodes,
   setLocalTrials,
 } from '../contexts/CodeContext';
+import { postApiJson } from '../utils/apiClient';
 
 export const AdminView: React.FC<{ onBack: () => void }> = ({ onBack }) => {
   const [pinInput, setPinInput] = useState('');
@@ -39,14 +40,32 @@ export const AdminView: React.FC<{ onBack: () => void }> = ({ onBack }) => {
 
   const fetchServerCodes = useCallback(async (pin: string) => {
     try {
-      const res = await fetch('/api/codes', { headers: { 'x-admin-pin': pin } });
+      const res = await fetch('/api/codes', {
+        headers: { 'x-admin-pin': pin },
+        cache: 'no-store',
+      });
       const data = await res.json();
       if (!res.ok || !Array.isArray(data.codes)) return;
-      const merged = data.codes.map((c: SubscriberCode) => ({
+      const serverCodes: SubscriberCode[] = data.codes.map((c: SubscriberCode) => ({
         ...c,
         ownerId: 'server',
         code: c.code.toUpperCase(),
       }));
+      const localCodes = loadStoredCodes();
+      const map = new Map<string, SubscriberCode>();
+      for (const lc of localCodes) {
+        map.set(lc.code.toUpperCase(), lc);
+      }
+      for (const sc of serverCodes) {
+        const key = sc.code.toUpperCase();
+        const existing = map.get(key);
+        if (!existing || (sc.updatedAtMs || 0) >= (existing.updatedAtMs || 0)) {
+          map.set(key, sc);
+        }
+      }
+      const merged = Array.from(map.values()).sort(
+        (a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0)
+      );
       setCodes(merged);
       saveStoredCodes(merged);
     } catch {
@@ -66,19 +85,18 @@ export const AdminView: React.FC<{ onBack: () => void }> = ({ onBack }) => {
     const pin = pinInput.trim();
     if (!pin) return;
     try {
-      const res = await fetch('/api/admin/verify-pin', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pin }),
-      });
-      const data = await res.json();
-      if (!res.ok || !data.ok) {
+      const { ok, data } = await postApiJson<{ ok?: boolean; message?: string }>(
+        '/api/admin/verify-pin',
+        { pin },
+        { timeoutMs: 12000, retries: 1 }
+      );
+      if (!ok || !data.ok) {
         setPinError(data.message || 'الكود السري غلط! دخل الكود الصحيح ديال الإدارة.');
         return;
       }
       setUnlockedPin(pin);
     } catch {
-      setPinError('تعذر التحقق من الكود السري.');
+      setPinError('تعذر التحقق من الكود السري، عاود حاول.');
     }
   };
 
@@ -106,11 +124,26 @@ export const AdminView: React.FC<{ onBack: () => void }> = ({ onBack }) => {
       if (!res.ok) {
         flash(data.error || 'تعذر حفظ الكود');
       } else {
-        await fetchServerCodes(unlockedPin);
+        const created: SubscriberCode = {
+          id: data.code?.id || `code_${Date.now()}`,
+          ownerId: 'server',
+          name: nameStr,
+          code: codeStr,
+          isActive: true,
+          trials: 0,
+          createdAtMs: data.code?.createdAtMs || Date.now(),
+          updatedAtMs: data.code?.updatedAtMs || Date.now(),
+          syncedToCloud: false,
+        };
+        const nextList = [created, ...codes.filter((c) => c.code.toUpperCase() !== codeStr)];
+        setCodes(nextList);
+        saveStoredCodes(nextList);
         setNewName('');
         setNewCode('');
         flash(`تم حفظ الكود ${codeStr} باسم ${nameStr}`);
       }
+    } catch {
+      flash('تعذر الاتصال بالخادم أثناء حفظ الكود');
     } finally {
       setSaving(false);
     }
@@ -119,45 +152,85 @@ export const AdminView: React.FC<{ onBack: () => void }> = ({ onBack }) => {
   const toggleCodeActive = async (item: SubscriberCode) => {
     if (!unlockedPin) return;
     const nextActive = !item.isActive;
-    await fetch(`/api/codes/${item.id}`, {
-      method: 'PATCH',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-admin-pin': unlockedPin,
-      },
-      body: JSON.stringify({ isActive: nextActive }),
-    });
-    await fetchServerCodes(unlockedPin);
-    flash(
-      nextActive
-        ? `تم تفعيل كود ${item.name} (${item.code})`
-        : `تم حظر/تعطيل كود ${item.name} (${item.code})`
-    );
+    try {
+      const res = await fetch(`/api/codes/${encodeURIComponent(item.id)}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-admin-pin': unlockedPin,
+        },
+        body: JSON.stringify({ isActive: nextActive, code: item.code, name: item.name }),
+      });
+      if (!res.ok) {
+        flash('تعذر تحديث حالة الكود');
+        return;
+      }
+      const nextList = codes.map((c) =>
+        c.id === item.id || c.code.toUpperCase() === item.code.toUpperCase()
+          ? { ...c, isActive: nextActive, updatedAtMs: Date.now() }
+          : c
+      );
+      setCodes(nextList);
+      saveStoredCodes(nextList);
+      flash(
+        nextActive
+          ? `تم تفعيل كود ${item.name} (${item.code})`
+          : `تم حظر/تعطيل كود ${item.name} (${item.code})`
+      );
+    } catch {
+      flash('تعذر الاتصال بالخادم لتحديث الكود');
+    }
   };
 
   const resetCodeTrials = async (item: SubscriberCode) => {
     if (!unlockedPin) return;
-    await fetch(`/api/codes/${item.id}`, {
-      method: 'PATCH',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-admin-pin': unlockedPin,
-      },
-      body: JSON.stringify({ trials: 0, isActive: true }),
-    });
-    setLocalTrials(item.code, 0);
-    await fetchServerCodes(unlockedPin);
-    flash(`تم تصفير العداد وتفعيل كود ${item.name} (${item.code}) من 0/10`);
+    try {
+      const res = await fetch(`/api/codes/${encodeURIComponent(item.id)}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-admin-pin': unlockedPin,
+        },
+        body: JSON.stringify({ trials: 0, isActive: true, code: item.code, name: item.name }),
+      });
+      if (!res.ok) {
+        flash('تعذر تصفير العداد');
+        return;
+      }
+      setLocalTrials(item.code, 0);
+      const nextList = codes.map((c) =>
+        c.id === item.id || c.code.toUpperCase() === item.code.toUpperCase()
+          ? { ...c, trials: 0, isActive: true, updatedAtMs: Date.now() }
+          : c
+      );
+      setCodes(nextList);
+      saveStoredCodes(nextList);
+      flash(`تم تصفير العداد وتفعيل كود ${item.name} (${item.code}) من 0/10`);
+    } catch {
+      flash('تعذر الاتصال بالخادم لتصفير العداد');
+    }
   };
 
   const deleteCode = async (item: SubscriberCode) => {
     if (!unlockedPin) return;
-    await fetch(`/api/codes/${item.id}`, {
-      method: 'DELETE',
-      headers: { 'x-admin-pin': unlockedPin },
-    });
-    await fetchServerCodes(unlockedPin);
-    flash(`تم حذف الكود ${item.code}`);
+    try {
+      const res = await fetch(`/api/codes/${encodeURIComponent(item.id)}`, {
+        method: 'DELETE',
+        headers: { 'x-admin-pin': unlockedPin },
+      });
+      if (!res.ok) {
+        flash('تعذر حذف الكود');
+        return;
+      }
+      const nextList = codes.filter(
+        (c) => c.id !== item.id && c.code.toUpperCase() !== item.code.toUpperCase()
+      );
+      setCodes(nextList);
+      saveStoredCodes(nextList);
+      flash(`تم حذف الكود ${item.code}`);
+    } catch {
+      flash('تعذر الاتصال بالخادم لحذف الكود');
+    }
   };
 
   const copyCode = async (item: SubscriberCode) => {
@@ -189,7 +262,7 @@ export const AdminView: React.FC<{ onBack: () => void }> = ({ onBack }) => {
             </div>
             <div>
               <h1 className="text-xl font-extrabold text-white">دخول لوحة الإدارة</h1>
-              <p className="text-xs text-slate-400">خاص بمدير تطبيق فاهم بلان (الرمز الافتراضي: 2026)</p>
+              <p className="text-xs text-slate-400">خاص بمدير تطبيق فاهم بلان</p>
             </div>
           </div>
 
@@ -197,6 +270,9 @@ export const AdminView: React.FC<{ onBack: () => void }> = ({ onBack }) => {
             <input
               type="password"
               dir="ltr"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
               value={pinInput}
               onChange={(e) => setPinInput(e.target.value)}
               placeholder="دخل الكود السري للإدارة"

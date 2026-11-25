@@ -59,6 +59,8 @@ export const SmartSiteTools: React.FC<{ toolId: ToolId }> = ({ toolId }) => {
   const magCalibSamplesRef = useRef<number[]>([]);
   const compassRefHeadingRef = useRef<number | null>(null);
   const lastCompassHeadingRef = useRef<number | null>(null);
+  const compassWarmupUntilRef = useRef<number>(0);
+  const lastCompassTickRef = useRef<number>(0);
   const lastRotRateRef = useRef<{ rate: number; ts: number }>({ rate: 0, ts: 0 });
   const hasAbsoluteOrientRef = useRef(false);
   const compassCleanupRef = useRef<(() => void) | null>(null);
@@ -76,12 +78,23 @@ export const SmartSiteTools: React.FC<{ toolId: ToolId }> = ({ toolId }) => {
   const [laserCam, setLaserCam] = useState(false);
 
   // AR meter
+  const [arTab, setArTab] = useState<'laser' | 'photo'>('laser');
   const [arMode, setArMode] = useState<'camera' | 'photo'>('photo');
   const [arPoints, setArPoints] = useState<{ x: number; y: number }[]>([]);
   const [arRefMeters, setArRefMeters] = useState('1.0');
   const [arPhoto, setArPhoto] = useState<string | null>(null);
   const [arImgDims, setArImgDims] = useState<{ w: number; h: number }>({ w: 1, h: 1 });
   const arImgRef = useRef<HTMLImageElement | null>(null);
+  const [arPhoneHeight, setArPhoneHeight] = useState('1.20');
+  const [arPitchDeg, setArPitchDeg] = useState(-28);
+  const [hasArSensor, setHasArSensor] = useState(false);
+  const [arNeedsPerm, setArNeedsPerm] = useState(false);
+  const [arPermErr, setArPermErr] = useState<string | null>(null);
+  const [arLockedDistM, setArLockedDistM] = useState<number | null>(null);
+  const [arLockedHeightM, setArLockedHeightM] = useState<number | null>(null);
+  const arEmaPitchRef = useRef<number | null>(null);
+  const arHasMotionRef = useRef(false);
+  const arGravSignRef = useRef<1 | -1 | null>(null);
 
   // Crack detector
   const [crackImg, setCrackImg] = useState<string | null>(null);
@@ -110,7 +123,7 @@ export const SmartSiteTools: React.FC<{ toolId: ToolId }> = ({ toolId }) => {
     if (camActive && streamRef.current && videoRef.current) {
       attachStreamToVideo(videoRef.current, streamRef.current);
     }
-  }, [camActive, laserCam, arMode]);
+  }, [camActive, laserCam, arMode, arTab]);
 
   const stopCameraStream = () => {
     if (streamRef.current) {
@@ -210,6 +223,8 @@ export const SmartSiteTools: React.FC<{ toolId: ToolId }> = ({ toolId }) => {
     hasAbsoluteOrientRef.current = false;
     compassRefHeadingRef.current = null;
     lastCompassHeadingRef.current = null;
+    compassWarmupUntilRef.current = 0;
+    lastCompassTickRef.current = 0;
     const mountedAt = Date.now();
 
     const onMotion = (ev: DeviceMotionEvent) => {
@@ -224,6 +239,7 @@ export const SmartSiteTools: React.FC<{ toolId: ToolId }> = ({ toolId }) => {
     const handleHeading = (rawHeading: number) => {
       if (magSourceRef.current === 'magnetometer') return;
 
+      const now = Date.now();
       if (magSourceRef.current !== 'compass') {
         magSourceRef.current = 'compass';
         setMagSource('compass');
@@ -233,11 +249,14 @@ export const SmartSiteTools: React.FC<{ toolId: ToolId }> = ({ toolId }) => {
 
       const prevH = lastCompassHeadingRef.current;
       const smoothedH =
-        prevH === null ? rawHeading : (prevH + wrapAngleDiff(rawHeading, prevH) * 0.38 + 360) % 360;
+        prevH === null ? rawHeading : (prevH + wrapAngleDiff(rawHeading, prevH) * 0.42 + 360) % 360;
       lastCompassHeadingRef.current = smoothedH;
 
+      // First valid sample starts a 600ms warmup so initial compass settle never triggers false alarms
       if (compassRefHeadingRef.current === null) {
         compassRefHeadingRef.current = smoothedH;
+        compassWarmupUntilRef.current = now + 600;
+        lastCompassTickRef.current = now;
         magBaselineRef.current = 46;
         magValueRef.current = 46;
         setMagBaseline(46);
@@ -245,28 +264,65 @@ export const SmartSiteTools: React.FC<{ toolId: ToolId }> = ({ toolId }) => {
         return;
       }
 
-      const recentRot = Date.now() - lastRotRateRef.current.ts < 350 ? lastRotRateRef.current.rate : 0;
-      if (recentRot > 22) {
+      const dtSec = Math.min(0.25, Math.max(0.01, (now - (lastCompassTickRef.current || now)) / 1000));
+      lastCompassTickRef.current = now;
+
+      if (now < compassWarmupUntilRef.current) {
         compassRefHeadingRef.current =
-          (compassRefHeadingRef.current + wrapAngleDiff(smoothedH, compassRefHeadingRef.current) * 0.25 + 360) %
-          360;
-      } else {
-        const dev = Math.abs(wrapAngleDiff(smoothedH, compassRefHeadingRef.current));
-        if (dev < 3.5) {
-          compassRefHeadingRef.current =
-            (compassRefHeadingRef.current +
-              wrapAngleDiff(smoothedH, compassRefHeadingRef.current) * 0.015 +
-              360) %
-            360;
-        }
+          (compassRefHeadingRef.current + wrapAngleDiff(smoothedH, compassRefHeadingRef.current) * 0.5 + 360) % 360;
+        magBaselineRef.current = 46;
+        magValueRef.current = 46;
+        setMagValue(46);
+        return;
       }
 
+      // Continuous time-based adaptive baseline (never freezes when aiming/turning phone in empty air):
+      // - During wrist rotation (>12 deg/s): fast baseline tracking (tau = 0.22s) + transient dampening
+      // - When stationary or sliding linearly along a wall: steady tracking (tau = 1.1s) so sharp rebar spikes trigger cleanly while empty air settles back to 46 uT
+      const recentRot = now - lastRotRateRef.current.ts < 250 ? lastRotRateRef.current.rate : 0;
+      const isRotating = recentRot > 12;
+      const tau = isRotating ? 0.22 : 1.1;
+      const adaptAlpha = 1 - Math.exp(-dtSec / tau);
+
+      compassRefHeadingRef.current =
+        (compassRefHeadingRef.current +
+          wrapAngleDiff(smoothedH, compassRefHeadingRef.current) * adaptAlpha +
+          360) %
+        360;
+
       const deviationDeg = Math.abs(wrapAngleDiff(smoothedH, compassRefHeadingRef.current));
-      const deltaUt = Math.min(110, deviationDeg * 1.45);
+      const effectiveDev = Math.max(0, deviationDeg - 2.2);
+      const rotDamp = recentRot > 20 ? 0.25 : isRotating ? 0.55 : 1.0;
+      const deltaUt = Math.min(110, effectiveDev * 2.1 * rotDamp);
       const equivUt = Math.round((46 + deltaUt) * 10) / 10;
       magValueRef.current = equivUt;
       setMagValue(Math.round(equivUt));
-      setMagPeakDelta((prev) => Math.max(prev, Math.round(deltaUt)));
+      if (deltaUt >= 5) {
+        setMagPeakDelta((prev) => Math.max(prev, Math.round(deltaUt)));
+      }
+    };
+
+    let prevOrientEuler: { a: number; b: number; g: number; ts: number } | null = null;
+    const updateEulerRotFallback = (ev: DeviceOrientationEvent) => {
+      // Only fill rotation rate when devicemotion isn't firing (non-absolute gyro axes if available)
+      if (ev.absolute === true) return;
+      const now = Date.now();
+      if (now - lastRotRateRef.current.ts < 220) return;
+      const a = typeof ev.alpha === 'number' && Number.isFinite(ev.alpha) ? ev.alpha : null;
+      const b = typeof ev.beta === 'number' && Number.isFinite(ev.beta) ? ev.beta : null;
+      const g = typeof ev.gamma === 'number' && Number.isFinite(ev.gamma) ? ev.gamma : null;
+      if (a === null || b === null || g === null) return;
+      if (prevOrientEuler) {
+        const dt = Math.max(0.015, (now - prevOrientEuler.ts) / 1000);
+        const da = wrapAngleDiff(a, prevOrientEuler.a);
+        const db = b - prevOrientEuler.b;
+        const dg = g - prevOrientEuler.g;
+        const rate = Math.hypot(da, db, dg) / dt;
+        if (Number.isFinite(rate)) {
+          lastRotRateRef.current = { rate, ts: now };
+        }
+      }
+      prevOrientEuler = { a, b, g, ts: now };
     };
 
     const onOrientAbs = (ev: DeviceOrientationEvent) => {
@@ -277,10 +333,18 @@ export const SmartSiteTools: React.FC<{ toolId: ToolId }> = ({ toolId }) => {
     };
 
     const onOrient = (ev: DeviceOrientationEvent) => {
-      const wch = (ev as DeviceOrientationEvent & { webkitCompassHeading?: number }).webkitCompassHeading;
-      if (typeof wch === 'number' && Number.isFinite(wch) && wch >= 0) {
+      updateEulerRotFallback(ev);
+      const iosEv = ev as DeviceOrientationEvent & {
+        webkitCompassHeading?: number;
+        webkitCompassAccuracy?: number;
+      };
+      if (typeof iosEv.webkitCompassHeading === 'number' && Number.isFinite(iosEv.webkitCompassHeading) && iosEv.webkitCompassHeading >= 0) {
+        // Ignore uncalibrated/invalid iOS compass samples (accuracy < 0)
+        if (typeof iosEv.webkitCompassAccuracy === 'number' && iosEv.webkitCompassAccuracy < 0) {
+          return;
+        }
         hasAbsoluteOrientRef.current = true;
-        handleHeading(wch);
+        handleHeading(iosEv.webkitCompassHeading);
         return;
       }
       if (hasAbsoluteOrientRef.current) return;
@@ -390,17 +454,15 @@ export const SmartSiteTools: React.FC<{ toolId: ToolId }> = ({ toolId }) => {
       requestPermission?: () => Promise<'granted' | 'denied'>;
     };
 
-    // On iOS 13+, requestPermission MUST run directly inside the user click gesture before any unrelated await
+    // On iOS 13+, BOTH requestPermission calls must be initiated synchronously inside the user click gesture before awaiting
     if (fromUserGesture && DOE && typeof DOE.requestPermission === 'function') {
       try {
-        const orientRes = await DOE.requestPermission();
-        if (DME && typeof DME.requestPermission === 'function') {
-          try {
-            await DME.requestPermission();
-          } catch {
-            // Motion permission optional; orientation compass still works
-          }
-        }
+        const orientPromise = DOE.requestPermission();
+        const motionPromise =
+          DME && typeof DME.requestPermission === 'function'
+            ? DME.requestPermission().catch(() => 'denied' as const)
+            : Promise.resolve('granted' as const);
+        const [orientRes] = await Promise.all([orientPromise, motionPromise]);
         if (orientRes === 'granted') {
           setMagNeedsPerm(false);
         } else {
@@ -484,6 +546,131 @@ export const SmartSiteTools: React.FC<{ toolId: ToolId }> = ({ toolId }) => {
     }
   };
 
+  // True 3-axis gravity pitch listener (+ DeviceOrientation beta fallback) for AR Laser Distance Meter
+  useEffect(() => {
+    if (toolId !== 'ar-meter') return;
+    arEmaPitchRef.current = null;
+    arHasMotionRef.current = false;
+    arGravSignRef.current = null;
+
+    const DOE = window.DeviceOrientationEvent as unknown as {
+      requestPermission?: () => Promise<'granted' | 'denied'>;
+    };
+    const DME = window.DeviceMotionEvent as unknown as {
+      requestPermission?: () => Promise<'granted' | 'denied'>;
+    };
+    if (
+      (DOE && typeof DOE.requestPermission === 'function') ||
+      (DME && typeof DME.requestPermission === 'function')
+    ) {
+      setArNeedsPerm(true);
+    }
+
+    const pushPitch = (rawDeg: number) => {
+      if (!Number.isFinite(rawDeg)) return;
+      const clamped = Math.max(-86, Math.min(86, rawDeg));
+      const prev = arEmaPitchRef.current;
+      const smoothed = prev === null ? clamped : prev * 0.72 + clamped * 0.28;
+      arEmaPitchRef.current = smoothed;
+      setArPitchDeg(smoothed);
+      setHasArSensor(true);
+      setArNeedsPerm(false);
+    };
+
+    const onMotion = (ev: DeviceMotionEvent) => {
+      const g = ev.accelerationIncludingGravity;
+      if (!g) return;
+      const gx = g.x ?? 0;
+      const gy = g.y ?? 0;
+      const gz = g.z ?? 0;
+      const mag = Math.hypot(gx, gy, gz);
+      if (!Number.isFinite(mag) || mag < 3) return;
+
+      arHasMotionRef.current = true;
+      // Android W3C upright proper acceleration has gy > 0; iOS Safari gravity vector has gy < 0.
+      if (Math.abs(gy) > 1.8) {
+        arGravSignRef.current = gy >= 0 ? 1 : -1;
+      }
+      const sign = arGravSignRef.current ?? (gy >= 0 ? 1 : -1);
+      const vertInPlane = Math.hypot(gx, gy);
+      // Camera (-Z) depression angle below horizontal: positive downward tilt => negative pitchDeg
+      const pitch = -(Math.atan2(gz * sign, vertInPlane) * 180) / Math.PI;
+      pushPitch(pitch);
+    };
+
+    const onOrient = (ev: DeviceOrientationEvent) => {
+      // Fallback only if devicemotion gravity hasn't fired
+      if (arHasMotionRef.current) return;
+      if (typeof ev.beta === 'number' && Number.isFinite(ev.beta)) {
+        const clampedBeta = Math.max(5, Math.min(175, ev.beta));
+        pushPitch(clampedBeta - 90);
+      }
+    };
+
+    window.addEventListener('devicemotion', onMotion);
+    window.addEventListener('deviceorientation', onOrient);
+    return () => {
+      window.removeEventListener('devicemotion', onMotion);
+      window.removeEventListener('deviceorientation', onOrient);
+    };
+  }, [toolId]);
+
+  const requestArSensorPermission = async () => {
+    setArPermErr(null);
+    const DOE = window.DeviceOrientationEvent as unknown as {
+      requestPermission?: () => Promise<'granted' | 'denied'>;
+    };
+    const DME = window.DeviceMotionEvent as unknown as {
+      requestPermission?: () => Promise<'granted' | 'denied'>;
+    };
+    try {
+      const orientP =
+        DOE && typeof DOE.requestPermission === 'function'
+          ? DOE.requestPermission()
+          : Promise.resolve('granted' as const);
+      const motionP =
+        DME && typeof DME.requestPermission === 'function'
+          ? DME.requestPermission()
+          : Promise.resolve('granted' as const);
+      const [orientRes, motionRes] = await Promise.all([orientP, motionP]);
+      if (orientRes === 'granted' || motionRes === 'granted') {
+        setArNeedsPerm(false);
+        setHasArSensor(true);
+      } else {
+        setArPermErr('ما عطيتيش الإذن لحساس الميلان والحركة ديال التليفون.');
+      }
+    } catch {
+      setArPermErr('تعذر تفعيل حساس الليزر، تأكد أن الموقع مفتوح عبر HTTPS.');
+    }
+  };
+
+  const playLaserClick = () => {
+    try {
+      if (navigator.vibrate) navigator.vibrate(30);
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AudioCtx) return;
+      if (!beepCtxRef.current || beepCtxRef.current.state === 'closed') {
+        beepCtxRef.current = new AudioCtx();
+      }
+      const ctx = beepCtxRef.current;
+      if (ctx.state === 'suspended') void ctx.resume();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.value = 1480;
+      gain.gain.setValueAtTime(0.08, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.065);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.07);
+    } catch {
+      // ignore
+    }
+  };
+
   // Geiger-style Beep & Vibration loop for metal detector (does NOT reset on sensor ticks)
   useEffect(() => {
     if (toolId !== 'metal-detector' || !beepOn) return;
@@ -555,6 +742,9 @@ export const SmartSiteTools: React.FC<{ toolId: ToolId }> = ({ toolId }) => {
       magBaselineRef.current = magValueRef.current;
       setMagBaseline(Math.round(magValueRef.current));
       compassRefHeadingRef.current = lastCompassHeadingRef.current;
+      compassWarmupUntilRef.current = Date.now() + 250;
+      magValueRef.current = 46;
+      setMagValue(magSourceRef.current === 'magnetometer' ? Math.round(magBaselineRef.current) : 46);
       setMagPeakDelta(0);
     };
 
@@ -940,6 +1130,25 @@ export const SmartSiteTools: React.FC<{ toolId: ToolId }> = ({ toolId }) => {
   }
 
   if (toolId === 'ar-meter') {
+    const phoneH = Math.max(
+      0.2,
+      Math.min(3.0, parseFloat((arPhoneHeight || '').replace(',', '.')) || 1.2)
+    );
+    const relPitchDeg = arPitchDeg;
+    const depressionDeg = -relPitchDeg;
+    const isAimingFloor = depressionDeg >= 6.5;
+    const depressionRad = (Math.min(86, Math.max(6.5, depressionDeg)) * Math.PI) / 180;
+    const liveFloorDistM = isAimingFloor
+      ? Math.max(0.15, Math.min(15, phoneH / Math.tan(depressionRad)))
+      : null;
+
+    const liveHeightM =
+      arLockedDistM !== null
+        ? Math.max(0, phoneH + arLockedDistM * Math.tan((relPitchDeg * Math.PI) / 180))
+        : null;
+
+    const activeDistM = arLockedDistM ?? liveFloorDistM;
+
     const syncImgDims = () => {
       const el = arImgRef.current;
       if (el && el.clientWidth > 0 && el.clientHeight > 0) {
@@ -967,216 +1176,446 @@ export const SmartSiteTools: React.FC<{ toolId: ToolId }> = ({ toolId }) => {
               ? '4/4: برك على نهاية البلاصة اللي باغي تعبرها'
               : `تم القياس بنجاح: ${measuredMeters?.toFixed(2)} متر (${Math.round((measuredMeters || 0) * 100)} سم)`;
 
+    const laserVoiceText =
+      arTab === 'laser'
+        ? activeDistM !== null
+          ? arLockedHeightM !== null
+            ? `المسافة من بلاصتك للحيط هي ${activeDistM.toFixed(2)} متر، والعلو اللي عبرتي هو ${arLockedHeightM.toFixed(2)} متر.`
+            : `المسافة المباشرة بالليزر من بلاصتك للحيط هي ${activeDistM.toFixed(2)} متر، يعني ${Math.round(activeDistM * 100)} سنتيمتر.`
+          : 'شعل الكاميرا ووجه نقطة الليزر الحمراء لتحت حتى تضرب فالقنت فين كيتلاقى الحيط مع الأرض باش يعطيك المسافة بالدقة.'
+        : measuredMeters
+          ? `القياس بالمتر ديال الصورة هو ${measuredMeters.toFixed(2)} متر، يعني ${Math.round(measuredMeters * 100)} سنتيمتر.`
+          : 'التقط لقطة أو اختار صورة، ومن بعد ورك على جوج نقط ديال طول معروف وجوج نقط ديال المسافة اللي باغي تعبرها.';
+
     return (
       <div className="space-y-5">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <h2 className="text-xl font-extrabold text-white">متر AR بالكاميرا</h2>
+            <h2 className="text-xl font-extrabold text-white">متر الليزر الذكي AR (ليزر + كاميرا)</h2>
             <p className="text-sm text-slate-400">
-              شعل الكاميرا والتقط صورة أو اختار صورة، علم على طول معروف ومن بعد عبر أي مسافة بدقة
+              وجه نقطة الليزر الحمراء لقاع الحيط باش تعبر المسافة من بلاصتك للحيط والعلو بدقة، أو عبر من صورة
             </p>
           </div>
-          <SpeakButton
-            id="smart-ar-voice"
-            variant="primary"
-            label="سمع بالدارجة"
-            text={
-              measuredMeters
-                ? `القياس التقريبي بالمتر ديال الكاميرا هو ${measuredMeters.toFixed(2)} متر، يعني ${Math.round(measuredMeters * 100)} سنتيمتر.`
-                : 'شعل الكاميرا ولا اختار صورة، التقط لقطة، ومن بعد ورك على جوج نقط ديال قياس معروف وجوج نقط ديال المسافة اللي باغي تعبرها.'
-            }
-          />
+          <SpeakButton id="smart-ar-voice" variant="primary" label="سمع النتيجة بالدارجة" text={laserVoiceText} />
         </div>
 
-        <div className="flex flex-wrap items-center gap-3">
+        <div className="flex flex-wrap items-center gap-2 p-1 rounded-xl border border-white/10 bg-[#0a0f1e] w-fit">
+          <button
+            type="button"
+            onClick={() => setArTab('laser')}
+            className={`min-h-[40px] px-4 rounded-lg text-xs font-extrabold transition-colors ${
+              arTab === 'laser' ? 'bg-[#ff7a1a] text-[#0a0f1e]' : 'text-slate-300 hover:text-white'
+            }`}
+          >
+            ليزر مباشر (من هنا للحائط)
+          </button>
           <button
             type="button"
             onClick={() => {
-              setArMode('camera');
-              void startCameraStream();
+              setArTab('photo');
+              stopCameraStream();
             }}
-            className="min-h-[44px] inline-flex items-center gap-2 rounded-xl bg-[#ff7a1a] text-[#0a0f1e] px-4 py-2 text-xs font-extrabold"
+            className={`min-h-[40px] px-4 rounded-lg text-xs font-extrabold transition-colors ${
+              arTab === 'photo' ? 'bg-[#ff7a1a] text-[#0a0f1e]' : 'text-slate-300 hover:text-white'
+            }`}
           >
-            <Camera className="w-4 h-4" />
-            <span>{camActive && arMode === 'camera' ? 'الكاميرا شغالة' : 'شعل الكاميرا'}</span>
+            قياس من صورة بمرجع
           </button>
-
-          {camActive && arMode === 'camera' && (
-            <button
-              type="button"
-              onClick={() => {
-                const v = videoRef.current;
-                if (!v) return;
-                const c = document.createElement('canvas');
-                c.width = v.videoWidth || 1280;
-                c.height = v.videoHeight || 720;
-                const ctx = c.getContext('2d');
-                if (ctx) {
-                  ctx.drawImage(v, 0, 0, c.width, c.height);
-                  setArPhoto(c.toDataURL('image/jpeg', 0.9));
-                  setArMode('photo');
-                  setArPoints([]);
-                  stopCameraStream();
-                }
-              }}
-              className="min-h-[44px] inline-flex items-center gap-2 rounded-xl bg-emerald-500 text-[#0a0f1e] px-4 py-2 text-xs font-extrabold"
-            >
-              <ScanLine className="w-4 h-4" />
-              <span>التقط لقطة متر AR</span>
-            </button>
-          )}
-
-          <label className="min-h-[44px] cursor-pointer inline-flex items-center gap-2 rounded-xl border border-white/15 bg-[#0a0f1e] px-4 py-2 text-xs font-bold text-white hover:border-[#ff7a1a]">
-            <Upload className="w-4 h-4 text-[#ff7a1a]" />
-            <span>أو ارفع صورة</span>
-            <input
-              type="file"
-              accept="image/*"
-              className="hidden"
-              onChange={(e) => {
-                const file = e.target.files?.[0];
-                e.target.value = '';
-                if (!file) return;
-                const r = new FileReader();
-                r.onload = () => {
-                  if (typeof r.result === 'string') {
-                    setArPhoto(r.result);
-                    setArMode('photo');
-                    setArPoints([]);
-                    stopCameraStream();
-                  }
-                };
-                r.readAsDataURL(file);
-              }}
-            />
-          </label>
-
-          <label className="flex items-center gap-2 text-xs text-slate-300">
-            <span>المرجع (متر):</span>
-            <input
-              type="text"
-              inputMode="decimal"
-              value={arRefMeters}
-              onChange={(e) => setArRefMeters(e.target.value)}
-              className="w-20 min-h-[40px] rounded-lg border border-white/15 bg-[#0a0f1e] px-2.5 text-white font-mono-nums"
-            />
-          </label>
-
-          {arPoints.length > 0 && (
-            <>
-              <button
-                type="button"
-                onClick={() => setArPoints((prev) => prev.slice(0, -1))}
-                className="min-h-[40px] rounded-xl border border-white/15 px-3 text-xs text-slate-200 hover:bg-white/10"
-              >
-                تراجع عن نقطة
-              </button>
-              <button
-                type="button"
-                onClick={() => setArPoints([])}
-                className="min-h-[40px] rounded-xl border border-white/15 px-3 text-xs text-slate-300 hover:bg-white/10"
-              >
-                مسح النقط
-              </button>
-            </>
-          )}
         </div>
 
-        {camErr && (
-          <div className="rounded-xl border border-amber-500/40 bg-amber-950/30 p-3 text-xs text-amber-200">
-            {camErr}
-          </div>
-        )}
+        {arTab === 'laser' ? (
+          <div className="space-y-4">
+            <div className="flex flex-wrap items-center gap-2.5">
+              <button
+                type="button"
+                onClick={() => (camActive ? stopCameraStream() : void startCameraStream())}
+                className={`min-h-[44px] inline-flex items-center gap-2 rounded-xl px-4 py-2 text-xs font-extrabold ${
+                  camActive ? 'bg-emerald-500 text-[#0a0f1e]' : 'bg-[#ff7a1a] text-[#0a0f1e]'
+                }`}
+              >
+                <Camera className="w-4 h-4" />
+                <span>{camActive ? 'الكاميرا شغالة (إيقاف)' : 'شعل كاميرا الليزر'}</span>
+              </button>
 
-        {arPhoto && arMode === 'photo' && (
-          <div className="rounded-xl border border-[#ff7a1a]/30 bg-[#0a0f1e] px-4 py-2.5 flex flex-wrap items-center justify-between gap-2">
-            <span className="text-xs font-bold text-[#ff7a1a]">{guideMsg}</span>
-            {measuredMeters !== null && (
-              <span className="text-lg font-extrabold font-mono-nums text-white">
-                {measuredMeters.toFixed(2)} م ({Math.round(measuredMeters * 100)} سم)
-              </span>
+              {arNeedsPerm && (
+                <button
+                  type="button"
+                  onClick={() => void requestArSensorPermission()}
+                  className="min-h-[44px] inline-flex items-center gap-2 rounded-xl bg-[#ff7a1a]/20 border border-[#ff7a1a]/50 px-4 text-xs font-extrabold text-[#ff7a1a]"
+                >
+                  <Smartphone className="w-4 h-4" />
+                  <span>تفعيل حساس الليزر (آيفون)</span>
+                </button>
+              )}
+            </div>
+
+            <div className="rounded-xl border border-white/10 bg-[#0a0f1e] p-3.5 flex flex-wrap items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="font-bold text-slate-300">علو التليفون على الأرض (متر):</span>
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  value={arPhoneHeight}
+                  onChange={(e) => setArPhoneHeight(e.target.value)}
+                  className="w-20 min-h-[38px] rounded-lg border border-white/15 bg-[#11182c] px-2.5 text-center text-white font-mono-nums"
+                />
+              </div>
+              <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                {[
+                  { val: '1.00', label: '1.00م' },
+                  { val: '1.20', label: 'عادي 1.20م' },
+                  { val: '1.35', label: '1.35م' },
+                  { val: '1.50', label: 'العين 1.50م' },
+                ].map((preset) => (
+                  <button
+                    key={preset.val}
+                    type="button"
+                    onClick={() => setArPhoneHeight(preset.val)}
+                    className={`rounded-lg px-2.5 py-1.5 font-bold ${
+                      arPhoneHeight === preset.val
+                        ? 'bg-[#ff7a1a] text-[#0a0f1e]'
+                        : 'bg-white/5 text-slate-300 hover:bg-white/10'
+                    }`}
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {(camErr || arPermErr) && (
+              <div className="rounded-xl border border-amber-500/40 bg-amber-950/30 p-3 text-xs text-amber-200">
+                {arPermErr || camErr}
+              </div>
+            )}
+
+            <div className="relative w-full h-[360px] sm:h-[420px] rounded-2xl overflow-hidden border border-white/15 bg-[#050814] flex items-center justify-center">
+              {camActive ? (
+                <video
+                  ref={(el) => {
+                    videoRef.current = el;
+                    attachStreamToVideo(el, streamRef.current);
+                  }}
+                  autoPlay
+                  playsInline
+                  muted
+                  className="absolute inset-0 w-full h-full object-cover"
+                />
+              ) : (
+                <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(255,122,26,0.08),transparent_70%)] flex flex-col items-center justify-end pb-14 pointer-events-none">
+                  <p className="text-xs text-slate-400">اضغط "شعل كاميرا الليزر" الفوق باش توجه نقطة الليزر مباشرة للحيط</p>
+                </div>
+              )}
+
+              {/* Optical Red Laser Dot + Surveying Reticle */}
+              <div className="pointer-events-none relative z-10 flex items-center justify-center">
+                <div className="w-28 h-28 rounded-full border border-red-500/45 flex items-center justify-center">
+                  <div className="w-12 h-12 rounded-full border border-red-400/75 flex items-center justify-center">
+                    <div className="w-3.5 h-3.5 rounded-full bg-red-500 shadow-[0_0_16px_4px_rgba(239,68,68,0.95)] ring-2 ring-white/80" />
+                  </div>
+                </div>
+                <div className="absolute w-36 h-[1px] bg-red-500/35" />
+                <div className="absolute h-36 w-[1px] bg-red-500/35" />
+              </div>
+
+              {/* Top HUD: Live Angle & Instructions */}
+              <div className="pointer-events-none absolute top-3 inset-x-3 flex items-center justify-between gap-2 z-20">
+                <div className="rounded-lg bg-[#0a0f1e]/85 border border-white/15 px-3 py-1.5 text-[11px] font-bold text-slate-200">
+                  {arLockedDistM === null
+                    ? '1. وجه نقطة الليزر لقاع الحيط (التقاء الحيط والأرض)'
+                    : '2. طلع نقطة الليزر لفوق الحيط باش تعبر العلو'}
+                </div>
+                <div className="rounded-lg bg-[#0a0f1e]/85 border border-white/15 px-2.5 py-1.5 text-xs font-mono-nums text-[#ff7a1a] font-bold">
+                  {relPitchDeg >= 0 ? `+${relPitchDeg.toFixed(1)}°` : `${relPitchDeg.toFixed(1)}°`}
+                </div>
+              </div>
+
+              {/* Bottom HUD: Live Distance & Height Readout */}
+              <div className="pointer-events-none absolute bottom-3 inset-x-3 z-20 flex flex-wrap items-center justify-between gap-2 rounded-xl bg-[#0a0f1e]/90 border border-red-500/40 px-4 py-2.5 backdrop-blur-sm">
+                <div>
+                  <p className="text-[11px] text-slate-400">
+                    {arLockedDistM !== null ? 'المسافة للحائط (مثبتة)' : 'المسافة المباشرة من هنا للحائط'}
+                  </p>
+                  <p className="text-2xl font-extrabold font-mono-nums text-white">
+                    {activeDistM !== null
+                      ? `${activeDistM.toFixed(2)} م (${Math.round(activeDistM * 100)} سم)`
+                      : depressionDeg > 1.5
+                        ? 'ميل لتحت أكثر لقاع الحيط ↓'
+                        : 'ميل التليفون لتحت ↓'}
+                  </p>
+                </div>
+
+                {arLockedDistM !== null && (
+                  <div className="text-left">
+                    <p className="text-[11px] text-emerald-300">
+                      {arLockedHeightM !== null ? 'العلو المثبت' : 'علو الهدف المباشر'}
+                    </p>
+                    <p className="text-xl font-extrabold font-mono-nums text-emerald-400">
+                      {(arLockedHeightM ?? liveHeightM ?? 0).toFixed(2)} م
+                    </p>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-3">
+              {arLockedDistM === null ? (
+                <button
+                  type="button"
+                  disabled={liveFloorDistM === null}
+                  onClick={() => {
+                    if (liveFloorDistM === null) return;
+                    setArLockedDistM(liveFloorDistM);
+                    setArLockedHeightM(null);
+                    playLaserClick();
+                  }}
+                  className="min-h-[48px] flex-1 sm:flex-none inline-flex items-center justify-center gap-2 rounded-xl bg-red-600 hover:bg-red-500 text-white px-5 py-2.5 text-sm font-extrabold disabled:opacity-40"
+                >
+                  <ScanLine className="w-4 h-4" />
+                  <span>تثبيت مسافة الحائط (النقطة 1)</span>
+                </button>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (liveHeightM !== null) {
+                        setArLockedHeightM(liveHeightM);
+                        playLaserClick();
+                      }
+                    }}
+                    className="min-h-[48px] inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-500 text-[#0a0f1e] px-5 py-2.5 text-sm font-extrabold"
+                  >
+                    <CheckCircle2 className="w-4 h-4" />
+                    <span>تثبيت العلو (النقطة 2)</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setArLockedDistM(null);
+                      setArLockedHeightM(null);
+                      playLaserClick();
+                    }}
+                    className="min-h-[48px] inline-flex items-center justify-center gap-2 rounded-xl border border-white/15 bg-[#0a0f1e] text-white px-4 py-2.5 text-xs font-bold hover:border-[#ff7a1a]"
+                  >
+                    <RotateCcw className="w-4 h-4 text-[#ff7a1a]" />
+                    <span>إعادة القياس</span>
+                  </button>
+                </>
+              )}
+            </div>
+
+            {!hasArSensor && (
+              <div className="rounded-xl border border-white/10 bg-[#0a0f1e] p-4 space-y-2">
+                <div className="flex items-center justify-between text-xs text-slate-300">
+                  <span>تجربة زاوية الليزر يدوياً (فالهاتف كيقرا الميلان أوتوماتيكياً):</span>
+                  <span className="font-mono-nums text-[#ff7a1a]">{relPitchDeg.toFixed(1)}°</span>
+                </div>
+                <input
+                  type="range"
+                  min="-75"
+                  max="65"
+                  step="0.5"
+                  value={arPitchDeg}
+                  onChange={(e) => setArPitchDeg(parseFloat(e.target.value))}
+                  className="w-full accent-[#ff7a1a]"
+                />
+              </div>
             )}
           </div>
-        )}
-
-        <div className="relative w-full min-h-[280px] rounded-2xl overflow-hidden border border-white/15 bg-black flex items-center justify-center p-2">
-          {arMode === 'camera' && camActive ? (
-            <video
-              ref={(el) => {
-                videoRef.current = el;
-                attachStreamToVideo(el, streamRef.current);
-              }}
-              autoPlay
-              playsInline
-              muted
-              className="w-full max-h-[380px] object-cover rounded-xl"
-            />
-          ) : arPhoto ? (
-            <div
-              onPointerDown={(e) => {
-                e.preventDefault();
-                syncImgDims();
-                const rect = e.currentTarget.getBoundingClientRect();
-                if (!rect.width || !rect.height) return;
-                const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-                const y = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
-                setArPoints((prev) => (prev.length >= 4 ? [{ x, y }] : [...prev, { x, y }]));
-              }}
-              className="relative inline-block cursor-crosshair select-none touch-none"
-            >
-              <img
-                ref={arImgRef}
-                src={arPhoto}
-                alt="لقطة متر AR"
-                onLoad={syncImgDims}
-                referrerPolicy="no-referrer"
-                className="block max-w-full max-h-[420px] w-auto h-auto pointer-events-none select-none rounded-lg"
-              />
-              <svg
-                className="absolute inset-0 w-full h-full pointer-events-none"
-                viewBox="0 0 100 100"
-                preserveAspectRatio="none"
+        ) : (
+          <>
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={() => {
+                  setArMode('camera');
+                  void startCameraStream();
+                }}
+                className="min-h-[44px] inline-flex items-center gap-2 rounded-xl bg-[#ff7a1a] text-[#0a0f1e] px-4 py-2 text-xs font-extrabold"
               >
-                {arPoints.length >= 2 && (
-                  <line
-                    x1={arPoints[0].x * 100}
-                    y1={arPoints[0].y * 100}
-                    x2={arPoints[1].x * 100}
-                    y2={arPoints[1].y * 100}
-                    stroke="#38bdf8"
-                    strokeWidth="0.9"
-                  />
-                )}
-                {arPoints.length >= 4 && (
-                  <line
-                    x1={arPoints[2].x * 100}
-                    y1={arPoints[2].y * 100}
-                    x2={arPoints[3].x * 100}
-                    y2={arPoints[3].y * 100}
-                    stroke="#ff7a1a"
-                    strokeWidth="1"
-                  />
-                )}
-                {arPoints.map((pt, i) => (
-                  <circle
-                    key={i}
-                    cx={pt.x * 100}
-                    cy={pt.y * 100}
-                    r="1.8"
-                    fill={i < 2 ? '#38bdf8' : '#ff7a1a'}
-                    stroke="#0a0f1e"
-                    strokeWidth="0.5"
-                  />
-                ))}
-              </svg>
+                <Camera className="w-4 h-4" />
+                <span>{camActive && arMode === 'camera' ? 'الكاميرا شغالة' : 'شعل الكاميرا'}</span>
+              </button>
+
+              {camActive && arMode === 'camera' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const v = videoRef.current;
+                    if (!v) return;
+                    const c = document.createElement('canvas');
+                    c.width = v.videoWidth || 1280;
+                    c.height = v.videoHeight || 720;
+                    const ctx = c.getContext('2d');
+                    if (ctx) {
+                      ctx.drawImage(v, 0, 0, c.width, c.height);
+                      setArPhoto(c.toDataURL('image/jpeg', 0.9));
+                      setArMode('photo');
+                      setArPoints([]);
+                      stopCameraStream();
+                    }
+                  }}
+                  className="min-h-[44px] inline-flex items-center gap-2 rounded-xl bg-emerald-500 text-[#0a0f1e] px-4 py-2 text-xs font-extrabold"
+                >
+                  <ScanLine className="w-4 h-4" />
+                  <span>التقط لقطة متر AR</span>
+                </button>
+              )}
+
+              <label className="min-h-[44px] cursor-pointer inline-flex items-center gap-2 rounded-xl border border-white/15 bg-[#0a0f1e] px-4 py-2 text-xs font-bold text-white hover:border-[#ff7a1a]">
+                <Upload className="w-4 h-4 text-[#ff7a1a]" />
+                <span>أو ارفع صورة</span>
+                <input
+                  type="file"
+                  accept="image/*"
+                  className="hidden"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    e.target.value = '';
+                    if (!file) return;
+                    const r = new FileReader();
+                    r.onload = () => {
+                      if (typeof r.result === 'string') {
+                        setArPhoto(r.result);
+                        setArMode('photo');
+                        setArPoints([]);
+                        stopCameraStream();
+                      }
+                    };
+                    r.readAsDataURL(file);
+                  }}
+                />
+              </label>
+
+              <label className="flex items-center gap-2 text-xs text-slate-300">
+                <span>المرجع (متر):</span>
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  value={arRefMeters}
+                  onChange={(e) => setArRefMeters(e.target.value)}
+                  className="w-20 min-h-[40px] rounded-lg border border-white/15 bg-[#0a0f1e] px-2.5 text-white font-mono-nums"
+                />
+              </label>
+
+              {arPoints.length > 0 && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => setArPoints((prev) => prev.slice(0, -1))}
+                    className="min-h-[40px] rounded-xl border border-white/15 px-3 text-xs text-slate-200 hover:bg-white/10"
+                  >
+                    تراجع عن نقطة
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setArPoints([])}
+                    className="min-h-[40px] rounded-xl border border-white/15 px-3 text-xs text-slate-300 hover:bg-white/10"
+                  >
+                    مسح النقط
+                  </button>
+                </>
+              )}
             </div>
-          ) : (
-            <div className="p-6 text-center space-y-2">
-              <Ruler className="w-10 h-10 text-[#ff7a1a] mx-auto" />
-              <p className="text-xs text-slate-300">شعل الكاميرا أو ارفع صورة باش تبدا القياس</p>
+
+            {camErr && (
+              <div className="rounded-xl border border-amber-500/40 bg-amber-950/30 p-3 text-xs text-amber-200">
+                {camErr}
+              </div>
+            )}
+
+            {arPhoto && arMode === 'photo' && (
+              <div className="rounded-xl border border-[#ff7a1a]/30 bg-[#0a0f1e] px-4 py-2.5 flex flex-wrap items-center justify-between gap-2">
+                <span className="text-xs font-bold text-[#ff7a1a]">{guideMsg}</span>
+                {measuredMeters !== null && (
+                  <span className="text-lg font-extrabold font-mono-nums text-white">
+                    {measuredMeters.toFixed(2)} م ({Math.round(measuredMeters * 100)} سم)
+                  </span>
+                )}
+              </div>
+            )}
+
+            <div className="relative w-full min-h-[280px] rounded-2xl overflow-hidden border border-white/15 bg-black flex items-center justify-center p-2">
+              {arMode === 'camera' && camActive ? (
+                <video
+                  ref={(el) => {
+                    videoRef.current = el;
+                    attachStreamToVideo(el, streamRef.current);
+                  }}
+                  autoPlay
+                  playsInline
+                  muted
+                  className="w-full max-h-[380px] object-cover rounded-xl"
+                />
+              ) : arPhoto ? (
+                <div
+                  onPointerDown={(e) => {
+                    e.preventDefault();
+                    syncImgDims();
+                    const rect = e.currentTarget.getBoundingClientRect();
+                    if (!rect.width || !rect.height) return;
+                    const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                    const y = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+                    setArPoints((prev) => (prev.length >= 4 ? [{ x, y }] : [...prev, { x, y }]));
+                  }}
+                  className="relative inline-block cursor-crosshair select-none touch-none"
+                >
+                  <img
+                    ref={arImgRef}
+                    src={arPhoto}
+                    alt="لقطة متر AR"
+                    onLoad={syncImgDims}
+                    referrerPolicy="no-referrer"
+                    className="block max-w-full max-h-[420px] w-auto h-auto pointer-events-none select-none rounded-lg"
+                  />
+                  <svg
+                    className="absolute inset-0 w-full h-full pointer-events-none"
+                    viewBox="0 0 100 100"
+                    preserveAspectRatio="none"
+                  >
+                    {arPoints.length >= 2 && (
+                      <line
+                        x1={arPoints[0].x * 100}
+                        y1={arPoints[0].y * 100}
+                        x2={arPoints[1].x * 100}
+                        y2={arPoints[1].y * 100}
+                        stroke="#38bdf8"
+                        strokeWidth="0.9"
+                      />
+                    )}
+                    {arPoints.length >= 4 && (
+                      <line
+                        x1={arPoints[2].x * 100}
+                        y1={arPoints[2].y * 100}
+                        x2={arPoints[3].x * 100}
+                        y2={arPoints[3].y * 100}
+                        stroke="#ff7a1a"
+                        strokeWidth="1"
+                      />
+                    )}
+                    {arPoints.map((pt, i) => (
+                      <circle
+                        key={i}
+                        cx={pt.x * 100}
+                        cy={pt.y * 100}
+                        r="1.8"
+                        fill={i < 2 ? '#38bdf8' : '#ff7a1a'}
+                        stroke="#0a0f1e"
+                        strokeWidth="0.5"
+                      />
+                    ))}
+                  </svg>
+                </div>
+              ) : (
+                <div className="p-6 text-center space-y-2">
+                  <Ruler className="w-10 h-10 text-[#ff7a1a] mx-auto" />
+                  <p className="text-xs text-slate-300">شعل الكاميرا أو ارفع صورة باش تبدا القياس</p>
+                </div>
+              )}
             </div>
-          )}
-        </div>
+          </>
+        )}
       </div>
     );
   }

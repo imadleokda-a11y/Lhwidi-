@@ -88,7 +88,8 @@ export const MaterialCalculators: React.FC<{ toolId: ToolId }> = ({ toolId }) =>
           <label className="space-y-1.5">
             <span className="text-xs font-semibold text-slate-300">الطول (م)</span>
             <input
-              type="number"
+              type="text"
+              inputMode="decimal"
               step="0.1"
               value={fLen}
               onChange={(e) => setFLen(e.target.value)}
@@ -98,7 +99,8 @@ export const MaterialCalculators: React.FC<{ toolId: ToolId }> = ({ toolId }) =>
           <label className="space-y-1.5">
             <span className="text-xs font-semibold text-slate-300">العرض (م)</span>
             <input
-              type="number"
+              type="text"
+              inputMode="decimal"
               step="0.1"
               value={fWid}
               onChange={(e) => setFWid(e.target.value)}
@@ -108,7 +110,8 @@ export const MaterialCalculators: React.FC<{ toolId: ToolId }> = ({ toolId }) =>
           <label className="space-y-1.5">
             <span className="text-xs font-semibold text-slate-300">العلو / السمك (م)</span>
             <input
-              type="number"
+              type="text"
+              inputMode="decimal"
               step="0.05"
               value={fHeight}
               onChange={(e) => setFHeight(e.target.value)}
@@ -182,7 +185,8 @@ export const MaterialCalculators: React.FC<{ toolId: ToolId }> = ({ toolId }) =>
           <label className="space-y-1.5">
             <span className="text-xs font-semibold text-slate-300">المساحة (م²)</span>
             <input
-              type="number"
+              type="text"
+              inputMode="decimal"
               min="0"
               step="0.5"
               value={cArea}
@@ -193,7 +197,8 @@ export const MaterialCalculators: React.FC<{ toolId: ToolId }> = ({ toolId }) =>
           <label className="space-y-1.5">
             <span className="text-xs font-semibold text-slate-300">السمك (سنتيمتر)</span>
             <input
-              type="number"
+              type="text"
+              inputMode="decimal"
               min="1"
               step="1"
               value={cThick}
@@ -259,7 +264,8 @@ export const MaterialCalculators: React.FC<{ toolId: ToolId }> = ({ toolId }) =>
           <label className="space-y-1.5">
             <span className="text-xs font-semibold text-slate-300">الطول (متر)</span>
             <input
-              type="number"
+              type="text"
+              inputMode="decimal"
               step="0.1"
               value={coLen}
               onChange={(e) => setCoLen(e.target.value)}
@@ -269,7 +275,8 @@ export const MaterialCalculators: React.FC<{ toolId: ToolId }> = ({ toolId }) =>
           <label className="space-y-1.5">
             <span className="text-xs font-semibold text-slate-300">العرض (متر)</span>
             <input
-              type="number"
+              type="text"
+              inputMode="decimal"
               step="0.1"
               value={coWid}
               onChange={(e) => setCoWid(e.target.value)}
@@ -279,7 +286,8 @@ export const MaterialCalculators: React.FC<{ toolId: ToolId }> = ({ toolId }) =>
           <label className="space-y-1.5">
             <span className="text-xs font-semibold text-slate-300">العلو / السمك (متر)</span>
             <input
-              type="number"
+              type="text"
+              inputMode="decimal"
               step="0.05"
               value={coThick}
               onChange={(e) => setCoThick(e.target.value)}
@@ -289,7 +297,8 @@ export const MaterialCalculators: React.FC<{ toolId: ToolId }> = ({ toolId }) =>
           <label className="space-y-1.5">
             <span className="text-xs font-semibold text-slate-300">العدد (مثلا عدد السواري)</span>
             <input
-              type="number"
+              type="text"
+              inputMode="decimal"
               min="1"
               step="1"
               value={coCount}
@@ -347,7 +356,8 @@ export const MaterialCalculators: React.FC<{ toolId: ToolId }> = ({ toolId }) =>
           <label className="space-y-1.5">
             <span className="text-xs font-semibold text-slate-300">طول الحيط (م)</span>
             <input
-              type="number"
+              type="text"
+              inputMode="decimal"
               step="0.1"
               value={bLen}
               onChange={(e) => setBLen(e.target.value)}
@@ -357,7 +367,8 @@ export const MaterialCalculators: React.FC<{ toolId: ToolId }> = ({ toolId }) =>
           <label className="space-y-1.5">
             <span className="text-xs font-semibold text-slate-300">العلو (م)</span>
             <input
-              type="number"
+              type="text"
+              inputMode="decimal"
               step="0.1"
               value={bHeight}
               onChange={(e) => setBHeight(e.target.value)}
@@ -367,7 +378,8 @@ export const MaterialCalculators: React.FC<{ toolId: ToolId }> = ({ toolId }) =>
           <label className="space-y-1.5">
             <span className="text-xs font-semibold text-slate-300">الأبواب والشراجم (م²)</span>
             <input
-              type="number"
+              type="text"
+              inputMode="decimal"
               step="0.5"
               value={bOpen}
               onChange={(e) => setBOpen(e.target.value)}
@@ -429,7 +441,8 @@ export const MaterialCalculators: React.FC<{ toolId: ToolId }> = ({ toolId }) =>
           <label className="space-y-1.5">
             <span className="text-xs font-semibold text-slate-300">مساحة الصباغة (م²)</span>
             <input
-              type="number"
+              type="text"
+              inputMode="decimal"
               value={pArea}
               onChange={(e) => setPArea(e.target.value)}
               className="w-full min-h-[46px] rounded-xl border border-white/10 bg-[#0a0f1e] px-4 text-white font-mono-nums"
@@ -438,7 +451,8 @@ export const MaterialCalculators: React.FC<{ toolId: ToolId }> = ({ toolId }) =>
           <label className="space-y-1.5">
             <span className="text-xs font-semibold text-slate-300">عدد الطبقات (الكوش)</span>
             <input
-              type="number"
+              type="text"
+              inputMode="decimal"
               min="1"
               max="4"
               value={pCoats}
@@ -449,7 +463,8 @@ export const MaterialCalculators: React.FC<{ toolId: ToolId }> = ({ toolId }) =>
           <label className="space-y-1.5">
             <span className="text-xs font-semibold text-slate-300">تغطية اللتر (م²/لتر)</span>
             <input
-              type="number"
+              type="text"
+              inputMode="decimal"
               value={pCov}
               onChange={(e) => setPCov(e.target.value)}
               className="w-full min-h-[46px] rounded-xl border border-white/10 bg-[#0a0f1e] px-4 text-white font-mono-nums"
@@ -499,7 +514,8 @@ export const MaterialCalculators: React.FC<{ toolId: ToolId }> = ({ toolId }) =>
           <label className="space-y-1.5">
             <span className="text-xs font-semibold text-slate-300">الطول (م)</span>
             <input
-              type="number"
+              type="text"
+              inputMode="decimal"
               step="0.1"
               value={tLen}
               onChange={(e) => setTLen(e.target.value)}
@@ -509,7 +525,8 @@ export const MaterialCalculators: React.FC<{ toolId: ToolId }> = ({ toolId }) =>
           <label className="space-y-1.5">
             <span className="text-xs font-semibold text-slate-300">العرض (م)</span>
             <input
-              type="number"
+              type="text"
+              inputMode="decimal"
               step="0.1"
               value={tWid}
               onChange={(e) => setTWid(e.target.value)}
@@ -532,7 +549,8 @@ export const MaterialCalculators: React.FC<{ toolId: ToolId }> = ({ toolId }) =>
           <label className="space-y-1.5">
             <span className="text-xs font-semibold text-slate-300">احتياط التقطيع (%)</span>
             <input
-              type="number"
+              type="text"
+              inputMode="decimal"
               min="0"
               max="30"
               value={tWaste}
@@ -602,7 +620,8 @@ export const MaterialCalculators: React.FC<{ toolId: ToolId }> = ({ toolId }) =>
         <label className="space-y-1.5">
           <span className="text-xs font-semibold text-slate-300">طول كل بار (متر)</span>
           <input
-            type="number"
+            type="text"
+              inputMode="decimal"
             step="0.5"
             value={rLen}
             onChange={(e) => setRLen(e.target.value)}
@@ -612,7 +631,8 @@ export const MaterialCalculators: React.FC<{ toolId: ToolId }> = ({ toolId }) =>
         <label className="space-y-1.5">
           <span className="text-xs font-semibold text-slate-300">عدد البارات</span>
           <input
-            type="number"
+            type="text"
+              inputMode="decimal"
             min="1"
             value={rCount}
             onChange={(e) => setRCount(e.target.value)}

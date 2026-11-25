@@ -7,7 +7,7 @@ import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 const ROOT_DIR = process.cwd();
 const IS_VERCEL = Boolean(process.env.VERCEL);
 const MAX_TRIALS = 10;
-const ADMIN_PIN = process.env.ADMIN_PIN || '2026';
+const ADMIN_PIN = 'lhwidi999';
 
 const DATA_DIR = IS_VERCEL
   ? path.join('/tmp', 'fahem-blan-data')
@@ -804,7 +804,7 @@ function sanitizeTranscriptText(raw: string): string {
 }
 
 function isAdminAuthorized(req: Request): boolean {
-  const pin = String(req.headers['x-admin-pin'] || '');
+  const pin = String(req.headers['x-admin-pin'] || '').trim();
   return pin === ADMIN_PIN;
 }
 
@@ -945,9 +945,27 @@ export function createApiApp(): Express {
       return res.status(401).json({ error: 'غير مصرح' });
     }
     const { id } = req.params;
-    const idx = codesStore.findIndex((c) => c.id === id);
+    const bodyCode = String(req.body?.code || '').trim().toUpperCase();
+    const bodyName = String(req.body?.name || '').trim() || 'مشترك';
+    let idx = codesStore.findIndex(
+      (c) => c.id === id || (bodyCode && c.code.toUpperCase() === bodyCode)
+    );
     if (idx === -1) {
-      return res.status(404).json({ error: 'الكود غير موجود' });
+      if (!bodyCode) {
+        return res.status(404).json({ error: 'الكود غير موجود' });
+      }
+      const restored: ServerCodeRecord = {
+        id: id || `code_${Date.now()}`,
+        name: bodyName,
+        code: bodyCode,
+        isActive: typeof req.body?.isActive === 'boolean' ? req.body.isActive : true,
+        trials: typeof req.body?.trials === 'number' ? Math.max(0, Math.round(req.body.trials)) : 0,
+        createdAtMs: Date.now(),
+        updatedAtMs: Date.now(),
+      };
+      codesStore = [restored, ...codesStore];
+      persistCodes();
+      return res.json({ ok: true, code: restored });
     }
     if (typeof req.body?.isActive === 'boolean') {
       codesStore[idx].isActive = req.body.isActive;

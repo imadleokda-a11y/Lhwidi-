@@ -1,0 +1,11 @@
+[
+  {
+    "id": "default_vip",
+    "name": "كود الافتتاح VIP",
+    "code": "FAHEM2026",
+    "isActive": true,
+    "trials": 0,
+    "createdAtMs": 1795617356464,
+    "updatedAtMs": 1795617356464
+  }
+]

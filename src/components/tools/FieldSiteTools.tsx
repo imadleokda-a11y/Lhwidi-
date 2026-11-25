@@ -626,16 +626,23 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
 
         <div className="relative w-full rounded-2xl overflow-hidden border border-white/15 bg-black flex items-center justify-center p-2">
           {camLive ? (
-            <video
-              ref={(el) => {
-                videoRef.current = el;
-                attachStreamToVideo(el, streamRef.current);
-              }}
-              autoPlay
-              playsInline
-              muted
-              className="w-full h-80 sm:h-96 object-cover rounded-xl"
-            />
+            <div className="relative w-full">
+              <video
+                ref={(el) => {
+                  videoRef.current = el;
+                  attachStreamToVideo(el, streamRef.current);
+                }}
+                autoPlay
+                playsInline
+                muted
+                className="w-full h-80 sm:h-96 object-cover rounded-xl"
+              />
+              <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+                <div className="w-14 h-14 rounded-full border border-red-400/75 flex items-center justify-center">
+                  <div className="w-3 h-3 rounded-full bg-red-500 shadow-[0_0_12px_3px_rgba(239,68,68,0.9)] ring-2 ring-white/75" />
+                </div>
+              </div>
+            </div>
           ) : (
             <div
               onPointerDown={(e) => {
