@@ -91,7 +91,7 @@ function getGeminiKeys(): string[] {
   const keys: string[] = [];
   const seen = new Set<string>();
   const addKey = (raw: string | undefined) => {
-    const val = (raw || '').trim();
+    const val = (raw || '').replace(/^["'\s]+|["'\s]+$/g, '').trim();
     if (!val || val === 'MY_GEMINI_API_KEY' || seen.has(val)) return;
     seen.add(val);
     keys.push(val);
@@ -99,7 +99,7 @@ function getGeminiKeys(): string[] {
 
   const numbered: Array<{ num: number; val: string }> = [];
   for (const [envName, envVal] of Object.entries(process.env)) {
-    const match = /^GEMINI_API_KEY_(\d+)$/i.exec(envName);
+    const match = /^GEMINI_API_KEY_?(\d+)$/i.exec(envName);
     if (match && envVal) {
       numbered.push({ num: Number(match[1]), val: envVal });
     }
@@ -120,6 +120,9 @@ function getGeminiKeys(): string[] {
   return keys;
 }
 
+// Returns ALL configured key indices in circular order starting from pool.currentIdx:
+// non-cooled keys first, followed by any currently cooled keys so wrap-around recovery
+// always checks every key in the circle before reporting exhaustion.
 function getOrderedKeyIndices(pool: KeyPoolState, keys: string[]): number[] {
   const n = keys.length;
   if (n === 0) return [];
@@ -127,25 +130,31 @@ function getOrderedKeyIndices(pool: KeyPoolState, keys: string[]): number[] {
   const start = ((pool.currentIdx % n) + n) % n;
 
   const ready: number[] = [];
+  const cooled: number[] = [];
   for (let offset = 0; offset < n; offset++) {
     const idx = (start + offset) % n;
     const until = pool.keyCooldownUntil.get(keys[idx]) || 0;
     if (until <= now) {
       ready.push(idx);
+    } else {
+      cooled.push(idx);
     }
   }
 
-  if (ready.length > 0) {
-    return ready;
+  if (ready.length === 0) {
+    // All keys were in cooldown -> reset cooldowns and start cleanly from next circular key
+    for (const k of keys) {
+      pool.keyCooldownUntil.delete(k);
+      pool.modelCooldownByKey.delete(k);
+    }
+    return cooled;
   }
 
-  // All keys hit cooldown -> wrap around cleanly back to Key 1 (index 0)
-  for (const k of keys) {
-    pool.keyCooldownUntil.delete(k);
-    pool.modelCooldownByKey.delete(k);
-  }
-  pool.currentIdx = 0;
-  return Array.from({ length: n }, (_, i) => i);
+  return [...ready, ...cooled];
+}
+
+function advanceCircularIndex(pool: KeyPoolState, keys: string[], usedIdx: number) {
+  pool.currentIdx = keys.length > 0 ? (usedIdx + 1) % keys.length : 0;
 }
 
 function getModelCooldownMap(pool: KeyPoolState, apiKey: string): Record<string, number> {
@@ -166,7 +175,7 @@ function markKeyCooldown(
   const key = keys[keyIdx];
   if (!key) return;
   pool.keyCooldownUntil.set(key, Date.now() + cooldownMs);
-  pool.currentIdx = keys.length > 0 ? (keyIdx + 1) % keys.length : 0;
+  advanceCircularIndex(pool, keys, keyIdx);
 }
 
 function createAiClientForKey(apiKey: string, apiVersion?: string): GoogleGenAI {
@@ -672,11 +681,11 @@ async function generateWithModelFallback(
     if (Date.now() >= deadlineMs - 1200) break;
     const keyIdx = order[i];
     const apiKey = keys[keyIdx];
-    const hasOtherKeys = i + 1 < order.length || keys.length > 1;
+    const hasRemainingKeys = i + 1 < order.length;
     const ai = createAiClientForKey(apiKey);
 
     try {
-      const res = await generateForSingleKey(ai, apiKey, hasOtherKeys, {
+      const res = await generateForSingleKey(ai, apiKey, hasRemainingKeys, {
         contents: params.contents,
         config: params.config,
         timeoutMs: perCallTimeout,
@@ -684,12 +693,13 @@ async function generateWithModelFallback(
         hedgeDelayMs,
         requireText,
       });
-      mainKeyPool.currentIdx = keyIdx;
+      // Advance circularly 1 -> 2 -> 3 -> 1 on every successful request
+      advanceCircularIndex(mainKeyPool, keys, keyIdx);
       return res;
     } catch (err: unknown) {
       if (err instanceof KeyRotationSignal) {
         lastErr = err.originalError;
-        const cooldownMs = err.isDailyQuota || err.isAuthError ? 900_000 : 60_000;
+        const cooldownMs = err.isDailyQuota || err.isAuthError ? 300_000 : 45_000;
         markKeyCooldown(mainKeyPool, keys, keyIdx, cooldownMs);
         continue;
       }
@@ -704,18 +714,22 @@ async function generateWithModelFallback(
       }
 
       if (isQuota || isAuthError) {
-        markKeyCooldown(mainKeyPool, keys, keyIdx, isDailyQuota || isAuthError ? 900_000 : 60_000);
+        markKeyCooldown(mainKeyPool, keys, keyIdx, isDailyQuota || isAuthError ? 300_000 : 45_000);
         continue;
       }
 
-      if (i + 1 < order.length && Date.now() < deadlineMs - 3000) {
+      if (is503) {
+        markKeyCooldown(mainKeyPool, keys, keyIdx, 15_000);
+      }
+
+      if (hasRemainingKeys && Date.now() < deadlineMs - 2000) {
         continue;
       }
       break;
     }
   }
 
-  // If single-key or all keys exhausted within budget, try one brief wrap-around retry when single-key 503
+  // If only 1 key exists and failed with transient 503, try one brief retry within remaining budget
   if (keys.length === 1 && Date.now() + 3500 < deadlineMs) {
     await new Promise((r) => setTimeout(r, 400));
     const ai = createAiClientForKey(keys[0]);
@@ -1268,13 +1282,13 @@ ${historyText}
                 }),
               keys.length > 1 ? 0 : 1
             );
-            mainKeyPool.currentIdx = keyIdx;
+            advanceCircularIndex(mainKeyPool, keys, keyIdx);
             return betaResp.text || '';
           } catch (err: unknown) {
             lastBetaErr = err;
             const { isQuota, isDailyQuota, isAuthError, shouldFallback } = classifyGeminiFailure(err);
             if (isQuota || isAuthError) {
-              markKeyCooldown(mainKeyPool, keys, keyIdx, isDailyQuota || isAuthError ? 900_000 : 60_000);
+              markKeyCooldown(mainKeyPool, keys, keyIdx, isDailyQuota || isAuthError ? 300_000 : 45_000);
               continue;
             }
             if (!shouldFallback) throw err;
@@ -1381,13 +1395,14 @@ ${historyText}
       const order = getOrderedKeyIndices(ttsKeyPool, keys);
       let audioBase64: string | undefined;
       let lastErr: unknown;
+      let allQuotaFailed = true;
 
       for (const keyIdx of order) {
         const apiKey = keys[keyIdx];
         const ai = createAiClientForKey(apiKey, 'v1beta');
         const ttsCooldownUntil = getModelCooldownMap(ttsKeyPool, apiKey);
         const retryCount = keys.length > 1 ? 0 : 1;
-        let keyExhausted = false;
+        let keyHandledCleanly = false;
 
         for (const model of ttsModels) {
           if ((ttsCooldownUntil[model] || 0) > Date.now()) {
@@ -1414,13 +1429,14 @@ ${historyText}
                       },
                     ],
                     config: {
+                      abortSignal: AbortSignal.timeout(14000),
                       responseModalities: ['AUDIO'],
                       speechConfig: {
                         voiceConfig: {
                           prebuiltVoiceConfig: { voiceName },
                         },
                       },
-                    },
+                    } as never,
                   }),
                 retryCount
               );
@@ -1438,13 +1454,14 @@ ${historyText}
                         },
                       ],
                       config: {
+                        abortSignal: AbortSignal.timeout(14000),
                         responseModalities: ['AUDIO'],
                         speechConfig: {
                           voiceConfig: {
                             prebuiltVoiceConfig: { voiceName },
                           },
                         },
-                      },
+                      } as never,
                     }),
                   retryCount
                 );
@@ -1457,18 +1474,24 @@ ${historyText}
             if (audioBase64) break;
           } catch (modelErr: unknown) {
             lastErr = modelErr;
-            const { is503, isQuota, isDailyQuota, isAuthError } = classifyGeminiFailure(modelErr);
+            const { is503, isQuota, isDailyQuota, isAuthError, shouldFallback } =
+              classifyGeminiFailure(modelErr);
+            if (!isQuota) allQuotaFailed = false;
+
             if (isQuota || isAuthError) {
-              ttsCooldownUntil[model] = Date.now() + 45_000;
+              ttsCooldownUntil[model] = Date.now() + 35_000;
               if (keys.length > 1 && (isDailyQuota || isAuthError)) {
-                markKeyCooldown(ttsKeyPool, keys, keyIdx, 900_000);
-                keyExhausted = true;
+                markKeyCooldown(ttsKeyPool, keys, keyIdx, 300_000);
+                keyHandledCleanly = true;
                 break;
               }
               continue;
             }
             if (is503) {
-              ttsCooldownUntil[model] = Date.now() + 20_000;
+              ttsCooldownUntil[model] = Date.now() + 15_000;
+              continue;
+            }
+            if (shouldFallback) {
               continue;
             }
             throw modelErr;
@@ -1476,33 +1499,33 @@ ${historyText}
         }
 
         if (audioBase64) {
-          ttsKeyPool.currentIdx = keyIdx;
+          // Advance independent TTS pool circularly: 1 -> 2 -> 3 -> 1
+          advanceCircularIndex(ttsKeyPool, keys, keyIdx);
           break;
         }
 
-        if (!keyExhausted && lastErr) {
-          const { isQuota, isDailyQuota, isAuthError } = classifyGeminiFailure(lastErr);
-          if (isQuota || isAuthError) {
-            markKeyCooldown(
-              ttsKeyPool,
-              keys,
-              keyIdx,
-              isDailyQuota || isAuthError ? 900_000 : 60_000
-            );
-          }
+        if (!keyHandledCleanly) {
+          const failureInfo = lastErr ? classifyGeminiFailure(lastErr) : null;
+          markKeyCooldown(
+            ttsKeyPool,
+            keys,
+            keyIdx,
+            failureInfo?.isDailyQuota || failureInfo?.isAuthError ? 300_000 : 30_000
+          );
         }
       }
 
       if (!audioBase64) {
-        if (lastErr) {
+        if (lastErr && !allQuotaFailed) {
           throw lastErr;
         }
         return res.status(429).json({
           ok: false,
           quotaExhausted: true,
+          allKeysExhausted: true,
           reason: 'quota_exhausted',
           message:
-            'وصلنا للحد المؤقت ديال الصوت السحابي، غادي نكمل بصوت المتصفح.',
+            'سالات الكوتا فجميع المفاتيح مؤقتاً، غادي يدور للول من بعد شوية.',
         });
       }
 
@@ -1538,16 +1561,17 @@ ${historyText}
         rawMsg.toLowerCase().includes('quota') ||
         rawMsg.includes('RESOURCE_EXHAUSTED');
       if (isQuota) {
-        console.info('[TTS] Free-tier quota exhausted; client falling back to browser speech.');
+        console.info('[TTS] All keys free-tier quota exhausted; client falling back to browser speech.');
       } else {
         console.info('[TTS] Cloud synthesis failed:', rawMsg.slice(0, 200));
       }
       return res.status(isQuota ? 429 : 500).json({
         ok: false,
         quotaExhausted: isQuota,
+        allKeysExhausted: isQuota,
         reason: isQuota ? 'quota_exhausted' : 'tts_failed',
         message: isQuota
-          ? 'سالات الكوتا اليومية ديال الصوت السحابي (10/يوم). فعّل مفتاح مدفوع في Settings > Secrets أو خدام حالياً بصوت المتصفح.'
+          ? 'سالات الكوتا فجميع المفاتيح مؤقتاً، خدام بصوت المتصفح حتى ترجع.'
           : 'تعذر تشغيل الصوت السحابي، خدام بصوت المتصفح.',
       });
     }

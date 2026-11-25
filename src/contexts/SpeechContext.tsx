@@ -670,17 +670,35 @@ export const SpeechProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         setIsLoadingAudio(true);
 
         try {
-          const res = await fetch('/api/tts', {
+          const payloadStr = JSON.stringify({
+            text: clippedText,
+            voiceGender: gender,
+            voiceId: voiceName,
+            voiceType: voiceName,
+          });
+          let res = await fetch('/api/tts', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              text: clippedText,
-              voiceGender: gender,
-              voiceId: voiceName,
-              voiceType: voiceName,
-            }),
+            body: payloadStr,
+            cache: 'no-store',
             signal: controller.signal,
           });
+          if (requestSeqRef.current !== seq) {
+            return { ok: false, stopped: true };
+          }
+          if ((res.status === 502 || res.status === 503 || res.status === 504) && !controller.signal.aborted) {
+            await new Promise((r) => setTimeout(r, 450));
+            if (requestSeqRef.current !== seq || controller.signal.aborted) {
+              return { ok: false, stopped: true };
+            }
+            res = await fetch('/api/tts', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: payloadStr,
+              cache: 'no-store',
+              signal: controller.signal,
+            });
+          }
           if (requestSeqRef.current !== seq) {
             return { ok: false, stopped: true };
           }
@@ -692,10 +710,12 @@ export const SpeechProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             const played = await playBase64Audio(data.audioBase64, mime, speechId, seq, rate);
             if (played) return { ok: true };
           } else {
-            if (res.status === 429 || data.quotaExhausted) {
-              quotaCooldownUntilRef.current = Date.now() + 15_000;
+            if (data.allKeysExhausted) {
+              quotaCooldownUntilRef.current = Date.now() + 2500;
+              showToast(data.message || 'سالات الكوتا فجميع المفاتيح مؤقتاً', 'err');
+            } else {
+              showToast(data.message || 'تعذر تشغيل الصوت السحابي، خدام بصوت المتصفح', 'err');
             }
-            showToast(data.message || 'تعذر تشغيل الصوت السحابي، خدام بصوت المتصفح', 'err');
           }
         } catch (err) {
           if (controller.signal.aborted || requestSeqRef.current !== seq) {
