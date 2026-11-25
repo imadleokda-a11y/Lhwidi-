@@ -99,6 +99,7 @@ export const SmartSiteTools: React.FC<{ toolId: ToolId }> = ({ toolId }) => {
   // Crack detector
   const [crackImg, setCrackImg] = useState<string | null>(null);
   const [crackLoading, setCrackLoading] = useState(false);
+  const [crackWaiting, setCrackWaiting] = useState(false);
   const [crackErr, setCrackErr] = useState<string | null>(null);
   const [crackResult, setCrackResult] = useState<CrackDiagnosis | null>(null);
 
@@ -1642,9 +1643,10 @@ export const SmartSiteTools: React.FC<{ toolId: ToolId }> = ({ toolId }) => {
               ctx.drawImage(img, 0, 0, w, h);
               return c.toDataURL('image/jpeg', q);
             };
-            let out = draw(896, 0.68);
-            if (out.length > 280_000) out = draw(720, 0.45);
-            if (out.length > 300_000) out = draw(600, 0.36);
+            let out = draw(1024, 0.68);
+            if (out.length > 720_000) out = draw(896, 0.56);
+            if (out.length > 500_000) out = draw(720, 0.45);
+            if (out.length > 320_000) out = draw(600, 0.36);
             resolve(out);
           } catch {
             resolve(src);
@@ -1662,11 +1664,12 @@ export const SmartSiteTools: React.FC<{ toolId: ToolId }> = ({ toolId }) => {
       }
       unlockAudio();
       setCrackLoading(true);
+      setCrackWaiting(false);
       setCrackErr(null);
       setCrackResult(null);
       try {
         const compactImg =
-          imgData.startsWith('data:') && imgData.length > 260_000
+          imgData.startsWith('data:') && imgData.length > 200_000
             ? await compressCrackImage(imgData)
             : imgData;
         const { ok, data } = await postApiJson<{
@@ -1676,7 +1679,11 @@ export const SmartSiteTools: React.FC<{ toolId: ToolId }> = ({ toolId }) => {
         }>(
           '/api/detect-cracks',
           { imageBase64: compactImg, mimeType: 'image/jpeg' },
-          { timeoutMs: 26000, retries: 1 }
+          {
+            timeoutMs: 60000,
+            retries: 3,
+            onWaitingServer: () => setCrackWaiting(true),
+          }
         );
         if (!ok || !data.success || !data.diagnosis) {
           throw new Error(data.error || 'تعذر فحص الصورة');
@@ -1689,6 +1696,7 @@ export const SmartSiteTools: React.FC<{ toolId: ToolId }> = ({ toolId }) => {
       } catch (err: unknown) {
         setCrackErr(err instanceof Error ? err.message : 'وقع خطأ أثناء فحص الشق');
       } finally {
+        setCrackWaiting(false);
         setCrackLoading(false);
       }
     };
@@ -1799,7 +1807,7 @@ export const SmartSiteTools: React.FC<{ toolId: ToolId }> = ({ toolId }) => {
         {crackLoading && (
           <div className="rounded-xl border border-[#ff7a1a]/30 bg-[#0a0f1e] p-4 flex items-center gap-3 text-sm text-white">
             <Loader2 className="w-5 h-5 animate-spin text-[#ff7a1a]" />
-            <span>جاري فحص الشق بالذكاء الاصطناعي...</span>
+            <span>{crackWaiting ? 'كنتسناو السيرفر...' : 'جاري فحص الشق بالذكاء الاصطناعي...'}</span>
           </div>
         )}
 

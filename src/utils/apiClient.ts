@@ -10,10 +10,11 @@ export async function postApiJson<T extends Record<string, unknown>>(
   options?: {
     timeoutMs?: number;
     retries?: number;
+    onWaitingServer?: (retryNumber: number, totalRetries: number) => void;
   }
 ): Promise<ApiFetchResult<T>> {
-  const timeoutMs = options?.timeoutMs ?? 22000;
-  const maxRetries = options?.retries ?? 1;
+  const timeoutMs = options?.timeoutMs ?? 60000;
+  const maxRetries = options?.retries ?? 3;
   const body = JSON.stringify(payload);
 
   let lastError: Error | null = null;
@@ -38,7 +39,12 @@ export async function postApiJson<T extends Record<string, unknown>>(
         throw new Error('حجم الصورة أو التسجيل كبير بزاف، عاود جرب بحجم أخف.');
       }
 
-      const isGatewayRetryable = res.status === 502 || res.status === 503 || res.status === 504;
+      const isTransientRetryable =
+        res.status === 429 ||
+        res.status === 502 ||
+        res.status === 503 ||
+        res.status === 504 ||
+        (res.status >= 500 && res.status < 600);
 
       let parsed: T | null = null;
       if (raw) {
@@ -51,9 +57,10 @@ export async function postApiJson<T extends Record<string, unknown>>(
         parsed = {} as T;
       }
 
-      if (parsed === null || isGatewayRetryable) {
+      if (parsed === null || isTransientRetryable) {
         if (attempt < maxRetries) {
-          await new Promise((r) => setTimeout(r, 550 * (attempt + 1)));
+          options?.onWaitingServer?.(attempt + 1, maxRetries);
+          await new Promise((r) => setTimeout(r, 1400 * (attempt + 1)));
           continue;
         }
         if (parsed === null) {
@@ -73,16 +80,22 @@ export async function postApiJson<T extends Record<string, unknown>>(
           ? err.name === 'AbortError'
           : err instanceof Error && err.name === 'AbortError';
 
-      lastError =
-        err instanceof Error &&
-        !isAbort &&
-        err.message !== 'Failed to fetch' &&
-        !err.message.includes('NetworkError')
-          ? err
-          : new Error('السيرفر تعطل شوية أو الانترنت ضعيف، عاود حاول دابا.');
+      const msg = err instanceof Error ? err.message : '';
+      const isNetworkIssue =
+        isAbort ||
+        msg === 'Failed to fetch' ||
+        msg.includes('NetworkError') ||
+        msg.includes('Load failed') ||
+        msg.includes('network');
 
-      if (attempt < maxRetries && (isAbort || lastError.message.includes('ضعيف'))) {
-        await new Promise((r) => setTimeout(r, 500));
+      lastError =
+        err instanceof Error && !isNetworkIssue
+          ? err
+          : new Error('السيرفر عليه ضغط دابا أو الانترنت تقيل، عاود حاول من بعد ثواني.');
+
+      if (attempt < maxRetries && isNetworkIssue) {
+        options?.onWaitingServer?.(attempt + 1, maxRetries);
+        await new Promise((r) => setTimeout(r, 1400 * (attempt + 1)));
         continue;
       }
       throw lastError;

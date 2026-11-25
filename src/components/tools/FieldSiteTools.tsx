@@ -850,7 +850,7 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
               }>(
                 '/api/transcribe',
                 { audioBase64: base64, mimeType: (blob.type || 'audio/webm').split(';')[0] },
-                { timeoutMs: 19000, retries: 1 }
+                { timeoutMs: 60000, retries: 3 }
               );
               if (ok && data.success && data.text) {
                 setRawIdea((prev) => `${prev} ${data.text}`.trim());
@@ -890,7 +890,7 @@ export const FieldSiteTools: React.FC<FieldSiteToolsProps> = ({
           title?: string;
           structuredDarija?: string;
           error?: string;
-        }>('/api/voice-idea-summary', { rawIdea }, { timeoutMs: 19000, retries: 1 });
+        }>('/api/voice-idea-summary', { rawIdea }, { timeoutMs: 60000, retries: 3 });
         if (!ok || data.success === false) {
           throw new Error(data.error || 'تعذر تنظيم الفكرة');
         }

@@ -97,15 +97,19 @@ async function prepareImageForAnalysis(
           return canvas.toDataURL('image/jpeg', quality);
         };
 
-        let analysisDataUrl = renderJpeg(896, 0.68);
-        if (analysisDataUrl.length > 280_000) {
-          analysisDataUrl = renderJpeg(896, 0.52);
+        // Guarantee compressed blueprint image stays well under 1MB for fast server upload
+        let analysisDataUrl = renderJpeg(1024, 0.68);
+        if (analysisDataUrl.length > 720_000) {
+          analysisDataUrl = renderJpeg(896, 0.58);
         }
-        if (analysisDataUrl.length > 300_000) {
-          analysisDataUrl = renderJpeg(720, 0.44);
+        if (analysisDataUrl.length > 520_000) {
+          analysisDataUrl = renderJpeg(800, 0.48);
+        }
+        if (analysisDataUrl.length > 380_000) {
+          analysisDataUrl = renderJpeg(680, 0.4);
         }
         if (analysisDataUrl.length > 320_000) {
-          analysisDataUrl = renderJpeg(600, 0.36);
+          analysisDataUrl = renderJpeg(560, 0.34);
         }
 
         let thumbnailDataUrl = renderJpeg(560, 0.55);
@@ -157,6 +161,7 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
   const [thumbnailSrc, setThumbnailSrc] = useState<string | undefined>(undefined);
   const [userNotes, setUserNotes] = useState('');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [waitingServerMsg, setWaitingServerMsg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [analysis, setAnalysis] = useState<BlueprintAnalysis | null>(null);
   const [showDetails, setShowDetails] = useState(true);
@@ -242,6 +247,7 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
     stop();
     unlockAudio();
     setError(null);
+    setWaitingServerMsg(null);
     setIsAnalyzing(true);
     setSavedSuccess(false);
     setAnalysis(null);
@@ -290,7 +296,11 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
             mimeType: payloadMime,
             notes: trimmedNotes,
           },
-          { timeoutMs: 27000, retries: 1 }
+          {
+            timeoutMs: 60000,
+            retries: 3,
+            onWaitingServer: () => setWaitingServerMsg('كنتسناو السيرفر...'),
+          }
         );
         if (!ok || !data.success || !data.analysis) {
           throw new Error(data.error || 'تعذر تحليل البلان، عاود حاول.');
@@ -323,6 +333,7 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'وقع خطأ أثناء تحليل الصورة.');
     } finally {
+      setWaitingServerMsg(null);
       setIsAnalyzing(false);
     }
   };
@@ -381,6 +392,7 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
       };
       setMessages((prev) => [...prev, userMsg]);
     }
+    setWaitingServerMsg(null);
     setIsChatLoading(true);
 
     try {
@@ -403,7 +415,7 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
       } else if ((!analysis || hasCustomChatImageRef.current) && imageSrc) {
         if (compressedSrc) {
           chatImg = compressedSrc;
-        } else if (imageSrc.startsWith('data:') && imageSrc.length > 350_000) {
+        } else if (imageSrc.startsWith('data:') && imageSrc.length > 250_000) {
           try {
             const prepared = await prepareImageForAnalysis(imageSrc);
             setCompressedSrc(prepared.analysisDataUrl);
@@ -413,7 +425,7 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
           } catch {
             // ignore
           }
-        } else if (!imageSrc.startsWith('data:') || imageSrc.length <= 420_000) {
+        } else if (!imageSrc.startsWith('data:') || imageSrc.length <= 250_000) {
           chatImg = imageSrc;
         }
       }
@@ -433,7 +445,11 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
           analysisContext: attachedImage || hasCustomChatImageRef.current ? undefined : analysis,
           history: historySnapshot,
         },
-        { timeoutMs: 21000, retries: 1 }
+        {
+          timeoutMs: 60000,
+          retries: 3,
+          onWaitingServer: () => setWaitingServerMsg('كنتسناو السيرفر...'),
+        }
       );
       if (!ok || !data.success || !data.reply) {
         throw new Error(data.error || 'تعذر الرد دابا.');
@@ -452,6 +468,7 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
       setFailedChatQuestion(question);
       setMicError(err instanceof Error ? err.message : 'تعذر إرسال السؤال.');
     } finally {
+      setWaitingServerMsg(null);
       setIsChatLoading(false);
     }
   };
@@ -579,7 +596,11 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
       const { ok, data } = await postApiJson<{ success?: boolean; text?: string; error?: string }>(
         '/api/transcribe',
         { audioBase64, mimeType: cleanMime },
-        { timeoutMs: 19000, retries: 1 }
+        {
+          timeoutMs: 60000,
+          retries: 3,
+          onWaitingServer: () => setMicStatus('كنتسناو السيرفر...'),
+        }
       );
       if (!ok || data.success === false) {
         throw new Error(data.error || 'تعذر تحويل الصوت لكتابة، عاود حاول.');
@@ -1286,9 +1307,10 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
                   <Loader2 className="w-4 h-4 animate-spin" />
                 </div>
                 <div className="rounded-2xl bg-[#11182c] border border-[#ff7a1a]/25 px-4 py-3 text-sm text-slate-200">
-                  {isAnalyzing
-                    ? 'المعلم الذكي كيقرا البلان وكيفصل الحديد والغرف بالدارجة...'
-                    : 'المعلم الذكي كيكتب ليك الجواب بالدارجة...'}
+                  {waitingServerMsg ||
+                    (isAnalyzing
+                      ? 'المعلم الذكي كيقرا البلان وكيفصل الحديد والغرف بالدارجة...'
+                      : 'المعلم الذكي كيكتب ليك الجواب بالدارجة...')}
                 </div>
               </div>
             )}

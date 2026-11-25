@@ -1049,8 +1049,8 @@ ${finalNotes ? `ملاحظة صاحب البلان: ${finalNotes}` : ''}
             { text: prompt },
           ],
         },
-        timeoutMs: 16000,
-        budgetMs: 24000,
+        timeoutMs: 24000,
+        budgetMs: 45000,
         hedgeDelayMs: 3200,
         config: {
           responseMimeType: 'application/json',
@@ -1122,16 +1122,16 @@ ${historyText}
       try {
         response = await generateWithModelFallback({
           contents: { parts },
-          timeoutMs: 9500,
-          budgetMs: 18500,
+          timeoutMs: 18000,
+          budgetMs: 36000,
           hedgeDelayMs: parts.length > 1 ? 3000 : 2100,
         });
       } catch (visionChatErr: unknown) {
         if (parts.length > 1 && analysisContext) {
           response = await generateWithModelFallback({
             contents: { parts: [{ text: promptText }] },
-            timeoutMs: 8000,
-            budgetMs: 14000,
+            timeoutMs: 15000,
+            budgetMs: 28000,
             hedgeDelayMs: 1800,
           });
         } else {
@@ -1185,8 +1185,8 @@ ${historyText}
             { text: crackPrompt },
           ],
         },
-        timeoutMs: 15000,
-        budgetMs: 23000,
+        timeoutMs: 22000,
+        budgetMs: 40000,
         hedgeDelayMs: 3000,
         config: {
           responseMimeType: 'application/json',
@@ -1287,8 +1287,8 @@ ${historyText}
       try {
         const response = await generateWithModelFallback({
           contents: { parts: audioParts },
-          timeoutMs: 8000,
-          budgetMs: 16500,
+          timeoutMs: 14000,
+          budgetMs: 28000,
           hedgeDelayMs: 2100,
           requireText: false,
         });
@@ -1327,8 +1327,8 @@ ${historyText}
       }
       const response = await generateWithModelFallback({
         contents: `رتب هاد الملاحظة الصوتية ديال الشانطي بالدارجة المغربية فـ عنوان قصير ولائحة منظمة ديال السلعة أو الخدمة المطلوبة:\n"${rawIdea}"\n\nأرجع JSON فقط بهذا الشكل: {"title":"عنوان قصير","structuredDarija":"النص المنظم بالدارجة"}`,
-        timeoutMs: 8500,
-        budgetMs: 17000,
+        timeoutMs: 14000,
+        budgetMs: 28000,
         hedgeDelayMs: 2100,
         config: {
           responseMimeType: 'application/json',
