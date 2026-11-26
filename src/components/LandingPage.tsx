@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   ArrowLeft,
   BookOpenCheck,
@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { HERO_IMAGE, WHATSAPP_NUMBER, WHATSAPP_URL } from '../constants';
 import { useDarijaSpeech } from '../contexts/SpeechContext';
+import { fetchVideoAdMeta, loadLocalVideoAd, type VideoAdMeta } from '../utils/videoAdStore';
 
 interface LandingPageProps {
   onEnterApp: () => void;
@@ -74,7 +75,49 @@ const WHY_ITEMS = [
 export const LandingPage: React.FC<LandingPageProps> = ({ onEnterApp, onOpenAdmin }) => {
   const { isSpeaking, isLoadingAudio, activeSpeechId, speakPro, stop } = useDarijaSpeech();
   const [videoNoticeOpen, setVideoNoticeOpen] = useState(false);
+  const [videoPlaying, setVideoPlaying] = useState(false);
+  const [videoAd, setVideoAd] = useState<VideoAdMeta>({ exists: false });
   const [heroImgFailed, setHeroImgFailed] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    let localBlobUrlToRevoke: string | null = null;
+
+    const loadAd = async () => {
+      const serverMeta = await fetchVideoAdMeta();
+      if (!active) return;
+      if (serverMeta.exists && serverMeta.url) {
+        setVideoAd(serverMeta);
+        return;
+      }
+      const localCached = await loadLocalVideoAd();
+      if (!active) {
+        if (localCached?.blobUrl) URL.revokeObjectURL(localCached.blobUrl);
+        return;
+      }
+      if (localCached) {
+        localBlobUrlToRevoke = localCached.blobUrl;
+        setVideoAd(localCached.meta);
+      } else {
+        setVideoAd({ exists: false });
+      }
+    };
+
+    void loadAd();
+    const onUpdated = () => {
+      setVideoPlaying(false);
+      void loadAd();
+    };
+    window.addEventListener('fahem-video-ad-updated', onUpdated);
+
+    return () => {
+      active = false;
+      window.removeEventListener('fahem-video-ad-updated', onUpdated);
+      if (localBlobUrlToRevoke) {
+        URL.revokeObjectURL(localBlobUrlToRevoke);
+      }
+    };
+  }, []);
 
   const isPlayingIntro = isSpeaking && activeSpeechId === 'landing-voice-demo';
 
@@ -332,52 +375,94 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onEnterApp, onOpenAdmi
             </p>
           </div>
 
-          <div className="relative aspect-video w-full rounded-3xl border border-white/10 bg-[#11182c] overflow-hidden flex items-center justify-center p-6">
-            <div className="absolute inset-0 blueprint-grid opacity-70 pointer-events-none" />
-
-            {!videoNoticeOpen ? (
-              <div className="relative z-10 flex flex-col items-center text-center gap-4">
-                <button
-                  type="button"
-                  onClick={() => setVideoNoticeOpen(true)}
-                  aria-label="تشغيل الفيديو"
-                  className="w-20 h-20 sm:w-24 sm:h-24 rounded-full bg-[#ff7a1a] hover:bg-[#ff8d3b] text-[#0a0f1e] flex items-center justify-center shadow-2xl shadow-[#ff7a1a]/30 transition-transform hover:scale-105 active:scale-95"
-                >
-                  <Play className="w-9 h-9 sm:w-10 sm:h-10 fill-current translate-x-0.5" />
-                </button>
-                <div className="space-y-1">
-                  <p className="text-base sm:text-lg font-extrabold text-white">
-                    فيديو الشرح التطبيقي
-                  </p>
-                  <p className="text-xs sm:text-sm text-slate-400">
-                    ورك على Play للمعاينة (غادي يتزاد الفيديو هنا قريباً)
-                  </p>
+          <div className="relative aspect-video w-full rounded-3xl border border-white/10 bg-[#11182c] overflow-hidden flex items-center justify-center">
+            {videoAd.exists && videoAd.url ? (
+              videoPlaying ? (
+                <video
+                  key={videoAd.url}
+                  src={videoAd.url}
+                  controls
+                  autoPlay
+                  playsInline
+                  className="w-full h-full object-contain bg-black"
+                />
+              ) : (
+                <div className="relative w-full h-full flex items-center justify-center p-6">
+                  <video
+                    src={videoAd.url}
+                    muted
+                    playsInline
+                    preload="metadata"
+                    className="absolute inset-0 w-full h-full object-cover opacity-50 pointer-events-none"
+                  />
+                  <div className="absolute inset-0 bg-gradient-to-t from-[#0a0f1e]/85 via-[#0a0f1e]/35 to-transparent pointer-events-none" />
+                  <div className="relative z-10 flex flex-col items-center text-center gap-4">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        stop();
+                        setVideoPlaying(true);
+                      }}
+                      aria-label="تشغيل الفيديو"
+                      className="w-20 h-20 sm:w-24 sm:h-24 rounded-full bg-[#ff7a1a] hover:bg-[#ff8d3b] text-[#0a0f1e] flex items-center justify-center shadow-2xl shadow-[#ff7a1a]/30 transition-transform hover:scale-105 active:scale-95"
+                    >
+                      <Play className="w-9 h-9 sm:w-10 sm:h-10 fill-current translate-x-0.5" />
+                    </button>
+                    <p className="text-base sm:text-lg font-extrabold text-white">
+                      شاهد فيديو الإعلان
+                    </p>
+                  </div>
                 </div>
-              </div>
+              )
             ) : (
-              <div className="relative z-10 max-w-md text-center space-y-4">
-                <p className="text-lg font-extrabold text-white">بلاصة الفيديو جاهزة</p>
-                <p className="text-sm text-slate-300 leading-relaxed">
-                  الفيديو التوضيحي غادي يتزاد فـ هاد البلاصة قريباً. فهاد الأثناء تقدر تسمع الشرح
-                  بالصوت أو تدخل تجرب التطبيق مجاناً مباشرة.
-                </p>
-                <div className="flex flex-wrap items-center justify-center gap-3">
-                  <button
-                    type="button"
-                    onClick={onEnterApp}
-                    className="min-h-[44px] rounded-xl bg-[#ff7a1a] hover:bg-[#ff8d3b] text-[#0a0f1e] px-5 py-2.5 text-sm font-extrabold transition-colors"
-                  >
-                    جرب مجانا
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setVideoNoticeOpen(false)}
-                    className="min-h-[44px] rounded-xl border border-white/15 bg-[#0a0f1e] hover:bg-white/5 text-slate-200 px-5 py-2.5 text-sm font-bold transition-colors"
-                  >
-                    رجوع
-                  </button>
-                </div>
-              </div>
+              <>
+                <div className="absolute inset-0 blueprint-grid opacity-70 pointer-events-none" />
+
+                {!videoNoticeOpen ? (
+                  <div className="relative z-10 flex flex-col items-center text-center gap-4 p-6">
+                    <button
+                      type="button"
+                      onClick={() => setVideoNoticeOpen(true)}
+                      aria-label="تشغيل الفيديو"
+                      className="w-20 h-20 sm:w-24 sm:h-24 rounded-full bg-[#ff7a1a] hover:bg-[#ff8d3b] text-[#0a0f1e] flex items-center justify-center shadow-2xl shadow-[#ff7a1a]/30 transition-transform hover:scale-105 active:scale-95"
+                    >
+                      <Play className="w-9 h-9 sm:w-10 sm:h-10 fill-current translate-x-0.5" />
+                    </button>
+                    <div className="space-y-1">
+                      <p className="text-base sm:text-lg font-extrabold text-white">
+                        فيديو الشرح التطبيقي
+                      </p>
+                      <p className="text-xs sm:text-sm text-slate-400">
+                        ورك على Play للمعاينة (غادي يتزاد الفيديو هنا قريباً)
+                      </p>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="relative z-10 max-w-md text-center space-y-4 p-6">
+                    <p className="text-lg font-extrabold text-white">بلاصة الفيديو جاهزة</p>
+                    <p className="text-sm text-slate-300 leading-relaxed">
+                      الفيديو التوضيحي غادي يتزاد فـ هاد البلاصة قريباً. فهاد الأثناء تقدر تسمع
+                      الشرح بالصوت أو تدخل تجرب التطبيق مجاناً مباشرة.
+                    </p>
+                    <div className="flex flex-wrap items-center justify-center gap-3">
+                      <button
+                        type="button"
+                        onClick={onEnterApp}
+                        className="min-h-[44px] rounded-xl bg-[#ff7a1a] hover:bg-[#ff8d3b] text-[#0a0f1e] px-5 py-2.5 text-sm font-extrabold transition-colors"
+                      >
+                        جرب مجانا
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setVideoNoticeOpen(false)}
+                        className="min-h-[44px] rounded-xl border border-white/15 bg-[#0a0f1e] hover:bg-white/5 text-slate-200 px-5 py-2.5 text-sm font-bold transition-colors"
+                      >
+                        رجوع
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </>
             )}
           </div>
         </section>

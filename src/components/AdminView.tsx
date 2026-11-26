@@ -9,6 +9,8 @@ import {
   RefreshCw,
   ShieldCheck,
   Trash2,
+  Upload,
+  Video,
 } from 'lucide-react';
 import type { SubscriberCode } from '../types';
 import { WHATSAPP_NUMBER } from '../constants';
@@ -20,6 +22,13 @@ import {
   setLocalTrials,
 } from '../contexts/CodeContext';
 import { postApiJson } from '../utils/apiClient';
+import {
+  clearLocalVideoAd,
+  fetchVideoAdMeta,
+  loadLocalVideoAd,
+  saveLocalVideoAd,
+  type VideoAdMeta,
+} from '../utils/videoAdStore';
 
 export const AdminView: React.FC<{ onBack: () => void }> = ({ onBack }) => {
   const [pinInput, setPinInput] = useState('');
@@ -33,10 +42,29 @@ export const AdminView: React.FC<{ onBack: () => void }> = ({ onBack }) => {
   const [toast, setToast] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
+  const [videoAd, setVideoAd] = useState<VideoAdMeta>({ exists: false });
+  const [uploadingVideo, setUploadingVideo] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [deletingVideo, setDeletingVideo] = useState(false);
+
   const flash = (msg: string) => {
     setToast(msg);
     setTimeout(() => setToast(null), 2600);
   };
+
+  const refreshVideoAd = useCallback(async () => {
+    const serverMeta = await fetchVideoAdMeta();
+    if (serverMeta.exists && serverMeta.url) {
+      setVideoAd(serverMeta);
+      return;
+    }
+    const localCached = await loadLocalVideoAd();
+    if (localCached) {
+      setVideoAd(localCached.meta);
+      return;
+    }
+    setVideoAd({ exists: false });
+  }, []);
 
   const fetchServerCodes = useCallback(async (pin: string) => {
     try {
@@ -76,8 +104,9 @@ export const AdminView: React.FC<{ onBack: () => void }> = ({ onBack }) => {
   useEffect(() => {
     if (unlockedPin) {
       void fetchServerCodes(unlockedPin);
+      void refreshVideoAd();
     }
-  }, [unlockedPin, fetchServerCodes]);
+  }, [unlockedPin, fetchServerCodes, refreshVideoAd]);
 
   const handlePinSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -240,6 +269,101 @@ export const AdminView: React.FC<{ onBack: () => void }> = ({ onBack }) => {
       setTimeout(() => setCopiedId(null), 1500);
     } catch {
       // ignore
+    }
+  };
+
+  const handleUploadVideoAd = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file || !unlockedPin) return;
+
+    const MAX_BYTES = 35 * 1024 * 1024;
+    if (file.size === 0) {
+      flash('هاد الملف خاوي.');
+      return;
+    }
+    if (file.size > MAX_BYTES) {
+      flash('حجم الفيديو كبير بزاف (الحد الأقصى 35 MB). صغّرو شوية وعاود رفعو.');
+      return;
+    }
+
+    setUploadingVideo(true);
+    setUploadProgress(5);
+    const mimeType = file.type || 'video/mp4';
+    const chunkSize = 2 * 1024 * 1024;
+    const totalChunks = Math.max(1, Math.ceil(file.size / chunkSize));
+    const uploadId = `ad_${Date.now()}`;
+
+    try {
+      let latestMeta: VideoAdMeta | null = null;
+      for (let i = 0; i < totalChunks; i++) {
+        const slice = file.slice(i * chunkSize, Math.min(file.size, (i + 1) * chunkSize));
+        const res = await fetch('/api/admin/video-ad', {
+          method: 'POST',
+          headers: {
+            'x-admin-pin': unlockedPin,
+            'Content-Type': 'application/octet-stream',
+            'x-video-name': encodeURIComponent(file.name || 'video-ad.mp4'),
+            'x-video-mime': mimeType,
+            'x-chunk-index': String(i),
+            'x-total-chunks': String(totalChunks),
+            'x-upload-id': uploadId,
+          },
+          body: slice,
+        });
+        const data = (await res.json().catch(() => ({}))) as {
+          ok?: boolean;
+          error?: string;
+          meta?: VideoAdMeta;
+        };
+        if (!res.ok || !data.ok) {
+          throw new Error(data.error || 'تعذر رفع الفيديو.');
+        }
+        setUploadProgress(Math.round(((i + 1) / totalChunks) * 100));
+        if (data.meta) {
+          latestMeta = data.meta;
+        }
+      }
+
+      const updatedAtMs = latestMeta?.updatedAtMs || Date.now();
+      await saveLocalVideoAd(file, {
+        fileName: file.name || 'video-ad.mp4',
+        mimeType,
+        updatedAtMs,
+      });
+
+      if (latestMeta?.exists && latestMeta.url) {
+        setVideoAd(latestMeta);
+      } else {
+        await refreshVideoAd();
+      }
+      window.dispatchEvent(new Event('fahem-video-ad-updated'));
+      flash('تم رفع الفيديو بنجاح وبان دابا فـ بلاصة الإعلان.');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'تعذر رفع الفيديو، عاود حاول.';
+      flash(msg);
+    } finally {
+      setUploadingVideo(false);
+      setUploadProgress(0);
+    }
+  };
+
+  const handleDeleteVideoAd = async () => {
+    if (!unlockedPin) return;
+    setDeletingVideo(true);
+    try {
+      await fetch('/api/admin/video-ad', {
+        method: 'DELETE',
+        headers: { 'x-admin-pin': unlockedPin },
+      });
+      await clearLocalVideoAd();
+      setVideoAd({ exists: false });
+      window.dispatchEvent(new Event('fahem-video-ad-updated'));
+      flash('تم حذف فيديو الإعلان.');
+    } catch {
+      flash('تعذر حذف الفيديو.');
+    } finally {
+      setDeletingVideo(false);
     }
   };
 
@@ -490,6 +614,88 @@ export const AdminView: React.FC<{ onBack: () => void }> = ({ onBack }) => {
                 })}
               </tbody>
             </table>
+          </div>
+        )}
+      </section>
+
+      <section className="rounded-2xl border border-white/10 bg-[#11182c] p-5 sm:p-6 space-y-5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2 text-[#ff7a1a] text-xs font-bold">
+              <Video className="w-4 h-4 shrink-0" />
+              <span>بلاصة الإشهار</span>
+            </div>
+            <h2 className="text-lg font-extrabold text-white">Video Ads</h2>
+            <p className="text-xs text-slate-400">
+              ارفع فيديو من الهاتف هنا وغادي يبان مباشرة فـ &quot;بلاصة الفيديو&quot; فصفحة البداية
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2.5">
+            <label
+              className={`min-h-[44px] cursor-pointer inline-flex items-center gap-2 rounded-xl bg-[#ff7a1a] hover:bg-[#ff8d3b] text-[#0a0f1e] px-4 py-2.5 text-sm font-extrabold transition-colors ${
+                uploadingVideo ? 'opacity-60 pointer-events-none' : ''
+              }`}
+            >
+              <Upload className="w-4 h-4 shrink-0" />
+              <span>
+                {uploadingVideo
+                  ? `جاري الرفع (${uploadProgress}%)...`
+                  : videoAd.exists
+                    ? 'تبديل الفيديو من الهاتف'
+                    : 'رفع فيديو من الهاتف'}
+              </span>
+              <input
+                type="file"
+                accept="video/mp4,video/webm,video/quicktime,video/*"
+                disabled={uploadingVideo}
+                onChange={(e) => void handleUploadVideoAd(e)}
+                className="hidden"
+              />
+            </label>
+
+            {videoAd.exists && (
+              <button
+                type="button"
+                disabled={deletingVideo || uploadingVideo}
+                onClick={() => void handleDeleteVideoAd()}
+                className="min-h-[44px] inline-flex items-center gap-1.5 rounded-xl border border-red-500/40 px-3.5 py-2 text-xs font-bold text-red-300 hover:bg-red-500/10 disabled:opacity-50"
+              >
+                <Trash2 className="w-4 h-4 shrink-0" />
+                <span>{deletingVideo ? 'جاري الحذف...' : 'حذف الفيديو'}</span>
+              </button>
+            )}
+          </div>
+        </div>
+
+        {videoAd.exists && videoAd.url ? (
+          <div className="space-y-2.5">
+            <div className="aspect-video w-full max-w-2xl rounded-2xl overflow-hidden border border-white/10 bg-black">
+              <video
+                key={videoAd.url}
+                src={videoAd.url}
+                controls
+                playsInline
+                preload="metadata"
+                className="w-full h-full object-contain"
+              />
+            </div>
+            <p className="text-xs text-slate-400">
+              الملف الحالي: <span className="text-slate-200 font-semibold">{videoAd.fileName}</span>
+              {typeof videoAd.sizeBytes === 'number' && (
+                <>
+                  {' '}
+                  ·{' '}
+                  <span className="font-mono-nums">
+                    {(videoAd.sizeBytes / (1024 * 1024)).toFixed(2)} MB
+                  </span>
+                </>
+              )}
+            </p>
+          </div>
+        ) : (
+          <div className="rounded-2xl border border-dashed border-white/15 bg-[#0a0f1e]/70 p-6 text-center text-xs text-slate-400">
+            مازال ما ترفع حتى فيديو للإشهار. ورك على &quot;رفع فيديو من الهاتف&quot; باش تختار الفيديو.
           </div>
         )}
       </section>

@@ -13,6 +13,58 @@ const DATA_DIR = IS_VERCEL
   ? path.join('/tmp', 'fahem-blan-data')
   : path.resolve(ROOT_DIR, 'data');
 const CODES_FILE = path.join(DATA_DIR, 'codes.json');
+const VIDEO_AD_META_FILE = path.join(DATA_DIR, 'video-ad-meta.json');
+const VIDEO_AD_FILE = path.join(DATA_DIR, 'video-ad.bin');
+
+interface VideoAdMetaRecord {
+  fileName: string;
+  mimeType: string;
+  sizeBytes: number;
+  updatedAtMs: number;
+}
+
+const ALLOWED_VIDEO_MIMES = new Set([
+  'video/mp4',
+  'video/webm',
+  'video/quicktime',
+  'video/x-m4v',
+  'video/ogg',
+  'video/3gpp',
+]);
+
+function normalizeVideoMime(raw: string | undefined): string {
+  const clean = (raw || '').split(';')[0].trim().toLowerCase();
+  if (ALLOWED_VIDEO_MIMES.has(clean)) return clean;
+  if (clean.startsWith('video/')) return clean;
+  return 'video/mp4';
+}
+
+function readVideoAdMeta(): VideoAdMetaRecord | null {
+  try {
+    if (!fs.existsSync(VIDEO_AD_META_FILE) || !fs.existsSync(VIDEO_AD_FILE)) {
+      return null;
+    }
+    const stat = fs.statSync(VIDEO_AD_FILE);
+    if (!stat.isFile() || stat.size === 0) return null;
+    const raw = fs.readFileSync(VIDEO_AD_META_FILE, 'utf8');
+    const parsed = JSON.parse(raw) as Partial<VideoAdMetaRecord>;
+    return {
+      fileName: String(parsed.fileName || 'video-ad.mp4'),
+      mimeType: normalizeVideoMime(parsed.mimeType),
+      sizeBytes: stat.size,
+      updatedAtMs: Number(parsed.updatedAtMs || stat.mtimeMs || Date.now()),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function persistVideoAdMeta(meta: VideoAdMetaRecord) {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+  fs.writeFileSync(VIDEO_AD_META_FILE, JSON.stringify(meta, null, 2), 'utf8');
+}
 
 export interface ServerCodeRecord {
   id: string;
@@ -1000,6 +1052,157 @@ export function createApiApp(): Express {
     codesStore = codesStore.filter((c) => c.id !== id);
     persistCodes();
     return res.json({ ok: true });
+  });
+
+  // --- Video Ads (Admin upload & Landing Page streaming) ---
+  app.get('/api/video-ad/meta', (_req: Request, res: Response) => {
+    const meta = readVideoAdMeta();
+    if (!meta) {
+      return res.json({ exists: false });
+    }
+    return res.json({
+      exists: true,
+      fileName: meta.fileName,
+      mimeType: meta.mimeType,
+      sizeBytes: meta.sizeBytes,
+      updatedAtMs: meta.updatedAtMs,
+      url: `/api/video-ad?v=${meta.updatedAtMs}`,
+    });
+  });
+
+  app.get('/api/video-ad', (req: Request, res: Response) => {
+    const meta = readVideoAdMeta();
+    if (!meta || !fs.existsSync(VIDEO_AD_FILE)) {
+      return res.status(404).json({ error: 'لا يوجد فيديو إعلاني حالياً.' });
+    }
+    const totalSize = meta.sizeBytes;
+    const rangeHeader = req.headers.range;
+
+    res.setHeader('Content-Type', meta.mimeType);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'public, max-age=60');
+
+    if (rangeHeader) {
+      const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
+      if (match) {
+        const start = match[1] ? Number(match[1]) : 0;
+        const end = match[2] ? Math.min(Number(match[2]), totalSize - 1) : totalSize - 1;
+        if (Number.isFinite(start) && Number.isFinite(end) && start <= end && start < totalSize) {
+          const chunkSize = end - start + 1;
+          res.status(206);
+          res.setHeader('Content-Range', `bytes ${start}-${end}/${totalSize}`);
+          res.setHeader('Content-Length', String(chunkSize));
+          const stream = fs.createReadStream(VIDEO_AD_FILE, { start, end });
+          stream.on('error', () => {
+            if (!res.headersSent) res.status(500).end();
+          });
+          stream.pipe(res);
+          return;
+        }
+      }
+      res.status(416).setHeader('Content-Range', `bytes */${totalSize}`).end();
+      return;
+    }
+
+    res.setHeader('Content-Length', String(totalSize));
+    const stream = fs.createReadStream(VIDEO_AD_FILE);
+    stream.on('error', () => {
+      if (!res.headersSent) res.status(500).end();
+    });
+    stream.pipe(res);
+  });
+
+  app.post(
+    '/api/admin/video-ad',
+    express.raw({ type: '*/*', limit: '35mb' }),
+    (req: Request, res: Response) => {
+      if (!isAdminAuthorized(req)) {
+        return res.status(401).json({ error: 'غير مصرح' });
+      }
+      try {
+        const bodyBuf = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+        if (bodyBuf.length === 0) {
+          return res.status(400).json({ error: 'ملف الفيديو فارغ.' });
+        }
+
+        if (!fs.existsSync(DATA_DIR)) {
+          fs.mkdirSync(DATA_DIR, { recursive: true });
+        }
+
+        const chunkIndexRaw = req.headers['x-chunk-index'];
+        const totalChunksRaw = req.headers['x-total-chunks'];
+        const chunkIndex = chunkIndexRaw !== undefined ? Number(chunkIndexRaw) : 0;
+        const totalChunks = totalChunksRaw !== undefined ? Number(totalChunksRaw) : 1;
+        const uploadId = String(req.headers['x-upload-id'] || 'single').replace(/[^a-zA-Z0-9_-]/g, '');
+        const rawFileName = String(req.headers['x-video-name'] || 'video-ad.mp4');
+        let fileName = 'video-ad.mp4';
+        try {
+          fileName = decodeURIComponent(rawFileName).slice(0, 120) || 'video-ad.mp4';
+        } catch {
+          fileName = rawFileName.slice(0, 120) || 'video-ad.mp4';
+        }
+        const mimeType = normalizeVideoMime(
+          String(req.headers['x-video-mime'] || req.headers['content-type'] || 'video/mp4')
+        );
+
+        if (totalChunks > 1) {
+          const stagingFile = path.join(DATA_DIR, `video-ad-${uploadId}.part`);
+          if (chunkIndex === 0) {
+            fs.writeFileSync(stagingFile, bodyBuf);
+          } else {
+            fs.appendFileSync(stagingFile, bodyBuf);
+          }
+
+          if (chunkIndex + 1 < totalChunks) {
+            return res.json({
+              ok: true,
+              partial: true,
+              receivedChunk: chunkIndex + 1,
+              totalChunks,
+            });
+          }
+
+          fs.renameSync(stagingFile, VIDEO_AD_FILE);
+        } else {
+          fs.writeFileSync(VIDEO_AD_FILE, bodyBuf);
+        }
+
+        const stat = fs.statSync(VIDEO_AD_FILE);
+        const updatedAtMs = Date.now();
+        const meta: VideoAdMetaRecord = {
+          fileName,
+          mimeType,
+          sizeBytes: stat.size,
+          updatedAtMs,
+        };
+        persistVideoAdMeta(meta);
+
+        return res.json({
+          ok: true,
+          meta: {
+            exists: true,
+            ...meta,
+            url: `/api/video-ad?v=${updatedAtMs}`,
+          },
+        });
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'Upload failed';
+        return res.status(500).json({ error: `تعذر حفظ الفيديو: ${msg}` });
+      }
+    }
+  );
+
+  app.delete('/api/admin/video-ad', (req: Request, res: Response) => {
+    if (!isAdminAuthorized(req)) {
+      return res.status(401).json({ error: 'غير مصرح' });
+    }
+    try {
+      if (fs.existsSync(VIDEO_AD_FILE)) fs.unlinkSync(VIDEO_AD_FILE);
+      if (fs.existsSync(VIDEO_AD_META_FILE)) fs.unlinkSync(VIDEO_AD_META_FILE);
+      return res.json({ ok: true });
+    } catch {
+      return res.status(500).json({ error: 'تعذر حذف الفيديو.' });
+    }
   });
 
   // --- Gemini Vision: Blueprint Analysis ---
