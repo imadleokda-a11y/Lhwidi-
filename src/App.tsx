@@ -28,6 +28,7 @@ import { ProjectsView } from './components/ProjectsView';
 import { SettingsView } from './components/SettingsView';
 import { AdminView } from './components/AdminView';
 import { CameraModal } from './components/CameraModal';
+import { LandingPage } from './components/LandingPage';
 
 const SAVED_PLANS_KEY = 'fahem_saved_plans_v1';
 const VOICE_NOTES_KEY = 'fahem_voice_notes_v1';
@@ -77,7 +78,7 @@ const OfflineBanner: React.FC = () => {
   );
 };
 
-const MainAppShell: React.FC = () => {
+const MainAppShell: React.FC<{ initialTab?: AppTab }> = ({ initialTab }) => {
   const { isSpeaking, isLoadingAudio, activeSpeechId, speakPro, stop } = useDarijaSpeech();
   const {
     activeCode,
@@ -88,6 +89,7 @@ const MainAppShell: React.FC = () => {
   } = useCodeAccess();
 
   const [activeTab, setActiveTab] = useState<AppTab>(() => {
+    if (initialTab) return initialTab;
     if (typeof window !== 'undefined' && window.location.pathname === '/admin') {
       return 'admin';
     }
@@ -410,11 +412,39 @@ const MainAppShell: React.FC = () => {
   );
 };
 
+const EntryRouter: React.FC = () => {
+  const { activeCode } = useCodeAccess();
+  const { stop } = useDarijaSpeech();
+  const isAdminRoute =
+    typeof window !== 'undefined' && window.location.pathname === '/admin';
+  const [enteredApp, setEnteredApp] = useState(false);
+  const [entryTab, setEntryTab] = useState<AppTab | undefined>(undefined);
+
+  if (!activeCode && !enteredApp && !isAdminRoute) {
+    return (
+      <LandingPage
+        onEnterApp={() => {
+          stop();
+          setEntryTab(undefined);
+          setEnteredApp(true);
+        }}
+        onOpenAdmin={() => {
+          stop();
+          setEntryTab('admin');
+          setEnteredApp(true);
+        }}
+      />
+    );
+  }
+
+  return <MainAppShell initialTab={entryTab} />;
+};
+
 export default function App() {
   return (
     <SpeechProvider>
       <CodeProvider>
-        <MainAppShell />
+        <EntryRouter />
       </CodeProvider>
     </SpeechProvider>
   );
