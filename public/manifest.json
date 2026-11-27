@@ -1,0 +1,32 @@
+{
+  "id": "/",
+  "name": "FAHEM",
+  "short_name": "FAHEM",
+  "description": "تطبيق مغربي ذكي لفهم مخططات البناء بالدارجة المغربية الصوتية، حساب مواد البناء، وتسيير المشاريع.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "theme_color": "#0a0f1e",
+  "background_color": "#0a0f1e",
+  "icons": [
+    {
+      "src": "/pwa-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-maskable-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
