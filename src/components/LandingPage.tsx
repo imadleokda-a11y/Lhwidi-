@@ -6,19 +6,26 @@ import {
   Headphones,
   LogIn,
   Play,
-  ShieldCheck,
   Sparkles,
   Volume2,
   VolumeX,
   Zap,
 } from 'lucide-react';
-import { HERO_IMAGE, WHATSAPP_NUMBER, WHATSAPP_URL } from '../constants';
+import {
+  COMPANY_NAME,
+  CONTACT_EMAIL,
+  HERO_IMAGE,
+  WHATSAPP_NUMBER,
+  WHATSAPP_URL,
+} from '../constants';
 import { useDarijaSpeech } from '../contexts/SpeechContext';
 import { fetchVideoAdMeta, loadLocalVideoAd, type VideoAdMeta } from '../utils/videoAdStore';
+import { SiteFooter, type InfoPageId } from './SiteFooter';
 
 interface LandingPageProps {
   onEnterApp: () => void;
   onOpenAdmin: () => void;
+  onOpenInfoPage: (page: InfoPageId) => void;
 }
 
 const STEPS = [
@@ -72,7 +79,11 @@ const WHY_ITEMS = [
   },
 ];
 
-export const LandingPage: React.FC<LandingPageProps> = ({ onEnterApp, onOpenAdmin }) => {
+export const LandingPage: React.FC<LandingPageProps> = ({
+  onEnterApp,
+  onOpenAdmin,
+  onOpenInfoPage,
+}) => {
   const { isSpeaking, isLoadingAudio, activeSpeechId, speakPro, stop } = useDarijaSpeech();
   const [videoNoticeOpen, setVideoNoticeOpen] = useState(false);
   const [videoPlaying, setVideoPlaying] = useState(false);
@@ -528,37 +539,46 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onEnterApp, onOpenAdmi
             </div>
           </div>
         </section>
+        {/* 6. Trust & Transparency Info (Ads Compliance) */}
+        <section className="max-w-6xl mx-auto px-4 sm:px-6 pb-12 border-t border-white/10 pt-10">
+          <div className="rounded-3xl border border-white/10 bg-[#11182c] p-6 sm:p-8 grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div className="space-y-2">
+              <p className="text-xs font-bold text-[#ff7a1a]">{COMPANY_NAME}</p>
+              <h3 className="text-base font-extrabold text-white">تطبيق مغربي للمقاولين والمهنيين</h3>
+              <p className="text-xs sm:text-sm text-slate-300 leading-relaxed">
+                منصة مخصصة لتسيير الأوراش، قراءة مخططات البناء بالدارجة، وتقدير الكميات بشكل عملي.
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <p className="text-xs font-bold text-[#ff7a1a]">الخصوصية والأمان</p>
+              <h3 className="text-base font-extrabold text-white">بياناتك خاصة ومفصولة</h3>
+              <p className="text-xs sm:text-sm text-slate-300 leading-relaxed">
+                كل مستخدم عندو فضاء ومشاريع خاصة به، ولا تتم مشاركة أو بيع أي معطيات مع الغير.
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <p className="text-xs font-bold text-[#ff7a1a]">الدعم الرسمي</p>
+              <h3 className="text-base font-extrabold text-white">تواصل مباشر وواضح</h3>
+              <p className="text-xs sm:text-sm text-slate-300 leading-relaxed">
+                الإيميل:{' '}
+                <a
+                  href={`mailto:${CONTACT_EMAIL}`}
+                  dir="ltr"
+                  className="text-white hover:text-[#ff7a1a] underline underline-offset-4"
+                >
+                  {CONTACT_EMAIL}
+                </a>
+                <br />
+                واتساب: <span dir="ltr">{WHATSAPP_NUMBER}</span>
+              </p>
+            </div>
+          </div>
+        </section>
       </main>
 
-      {/* Quiet Footer */}
-      <footer className="border-t border-white/10 bg-[#0a0f1e]">
-        <div className="max-w-6xl mx-auto px-4 sm:px-6 py-6 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-slate-400">
-          <div className="flex items-center gap-2">
-            <span className="font-bold text-white">فاهم البلان</span>
-            <span aria-hidden="true">·</span>
-            <span>فهم الدرس بسهولة بالصوت بالدارجة</span>
-          </div>
-
-          <div className="flex items-center gap-5">
-            <a
-              href={WHATSAPP_URL}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="hover:text-white transition-colors"
-            >
-              واتساب {WHATSAPP_NUMBER}
-            </a>
-            <button
-              type="button"
-              onClick={onOpenAdmin}
-              className="inline-flex items-center gap-1 hover:text-[#ff7a1a] transition-colors py-1"
-            >
-              <ShieldCheck className="w-3.5 h-3.5" />
-              <span>الإدارة</span>
-            </button>
-          </div>
-        </div>
-      </footer>
+      <SiteFooter onOpenPage={onOpenInfoPage} onOpenAdmin={onOpenAdmin} />
     </div>
   );
 };

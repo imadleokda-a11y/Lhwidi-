@@ -29,6 +29,17 @@ import { SettingsView } from './components/SettingsView';
 import { AdminView } from './components/AdminView';
 import { CameraModal } from './components/CameraModal';
 import { LandingPage } from './components/LandingPage';
+import { LegalPagesView } from './components/LegalPages';
+import { SiteFooter, type InfoPageId } from './components/SiteFooter';
+
+function getInfoPageFromPath(pathname: string): InfoPageId | null {
+  const clean = pathname.replace(/\/+$/, '').toLowerCase();
+  if (clean === '/privacy' || clean === '/privacy-policy') return 'privacy';
+  if (clean === '/terms' || clean === '/terms-and-conditions') return 'terms';
+  if (clean === '/about' || clean === '/about-us') return 'about';
+  if (clean === '/contact' || clean === '/contact-us') return 'contact';
+  return null;
+}
 
 const SAVED_PLANS_KEY = 'fahem_saved_plans_v1';
 const VOICE_NOTES_KEY = 'fahem_voice_notes_v1';
@@ -78,7 +89,10 @@ const OfflineBanner: React.FC = () => {
   );
 };
 
-const MainAppShell: React.FC<{ initialTab?: AppTab }> = ({ initialTab }) => {
+const MainAppShell: React.FC<{
+  initialTab?: AppTab;
+  onOpenInfoPage: (page: InfoPageId) => void;
+}> = ({ initialTab, onOpenInfoPage }) => {
   const { isSpeaking, isLoadingAudio, activeSpeechId, speakPro, stop } = useDarijaSpeech();
   const {
     activeCode,
@@ -365,6 +379,12 @@ const MainAppShell: React.FC<{ initialTab?: AppTab }> = ({ initialTab }) => {
         {activeTab === 'admin' && <AdminView onBack={() => setActiveTab('home')} />}
       </main>
 
+      <SiteFooter
+        onOpenPage={onOpenInfoPage}
+        onOpenAdmin={() => setActiveTab('admin')}
+        extraBottomPadding
+      />
+
       <nav
         aria-label="التنقل الرئيسي"
         className="md:hidden fixed bottom-0 left-0 right-0 z-40 border-t border-white/10 bg-[#0a0f1e]/95 backdrop-blur-md pb-safe"
@@ -419,6 +439,55 @@ const EntryRouter: React.FC = () => {
     typeof window !== 'undefined' && window.location.pathname === '/admin';
   const [enteredApp, setEnteredApp] = useState(false);
   const [entryTab, setEntryTab] = useState<AppTab | undefined>(undefined);
+  const [infoPage, setInfoPage] = useState<InfoPageId | null>(() => {
+    if (typeof window === 'undefined') return null;
+    return getInfoPageFromPath(window.location.pathname);
+  });
+
+  useEffect(() => {
+    const onPopState = () => {
+      setInfoPage(getInfoPageFromPath(window.location.pathname));
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+
+  const openInfoPage = (page: InfoPageId) => {
+    stop();
+    setInfoPage(page);
+    if (typeof window !== 'undefined') {
+      const targetPath = `/${page}`;
+      if (window.location.pathname !== targetPath) {
+        window.history.pushState({}, '', targetPath);
+      }
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  };
+
+  const closeInfoPage = () => {
+    setInfoPage(null);
+    if (typeof window !== 'undefined') {
+      if (getInfoPageFromPath(window.location.pathname)) {
+        window.history.pushState({}, '', '/');
+      }
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  };
+
+  if (infoPage) {
+    return (
+      <LegalPagesView
+        page={infoPage}
+        onBack={closeInfoPage}
+        onOpenPage={openInfoPage}
+        onOpenAdmin={() => {
+          closeInfoPage();
+          setEntryTab('admin');
+          setEnteredApp(true);
+        }}
+      />
+    );
+  }
 
   if (!activeCode && !enteredApp && !isAdminRoute) {
     return (
@@ -433,11 +502,12 @@ const EntryRouter: React.FC = () => {
           setEntryTab('admin');
           setEnteredApp(true);
         }}
+        onOpenInfoPage={openInfoPage}
       />
     );
   }
 
-  return <MainAppShell initialTab={entryTab} />;
+  return <MainAppShell initialTab={entryTab} onOpenInfoPage={openInfoPage} />;
 };
 
 export default function App() {
